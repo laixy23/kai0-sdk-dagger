@@ -1,0 +1,129 @@
+{
+  "status": "staged_only_not_installed_on_robot",
+  "source_repository": "https://github.com/agilexrobotics/piper_sdk",
+  "commit": "b847e5393a7ce6ff8508d713eca7bdd3a42421b4",
+  "tag": "0.7.0a1",
+  "source_archive_sha256": "5db1b1ade7a2d1173361d2c9a7b12cf8993d25d3474a191261892deca348911c",
+  "official_kai0_commit": "9d93078c757840f50e75248c5c5a94ab7b41e13a",
+  "published_wheel_python_files_compared": 195,
+  "wheel_vs_repository_python_differences": [],
+  "sdk_package_source_sha256": "141220166c26525b24b93c05f08c31455e99eda7ca01f608288703104e939e10",
+  "offline_contract": {
+    "methods": 18,
+    "dto_fields": 52,
+    "socket_attempts": 0,
+    "sdk_interface_instances": 0,
+    "hardware_control_writes": 0,
+    "local_test_python": "3.9.6 isolated /tmp venv; rerun contract on ROS Python3.11 before hardware"
+  },
+  "helper_fake_tests_passed": 20,
+  "firmwares": {
+    "can_left_slave": "S-V1.9-0260711",
+    "can_right_slave": "S-V1.9-1260924",
+    "can_left_mas": "S-V1.9-0260714",
+    "can_right_mas": "S-V1.9-0260715"
+  },
+  "deployment_changes": {
+    "node": "two-line V3 import/constructor selection only",
+    "helper": "pin0.7.0a1 + V3 class + raw gripper byte7 WIDTH guard",
+    "preflight": "all4 passive raw feedback/width/fault/freshness checks"
+  },
+  "files": [
+    {
+      "path": "README.txt",
+      "bytes": 6466,
+      "sha256": "91900badd45acbf2a8bb7a73eb2dbefd1e7a67b20b90d3391877b0b7376cc46f"
+    },
+    {
+      "path": "artifacts/piper_sdk-0.6.2-py3-none-any.whl",
+      "bytes": 194143,
+      "sha256": "d4aa1088fd6716f2f8c81a269dc5fb88b4c875a859e1c06e95bf2e9e8a6493c6"
+    },
+    {
+      "path": "artifacts/piper_sdk-0.7.0a1-py3-none-any.whl",
+      "bytes": 281345,
+      "sha256": "599677152cc8bed8e0dd11cec89f46e0e7e95b2b2be002ffe74d1459e17e4d51"
+    },
+    {
+      "path": "check_sdk_contract.py",
+      "bytes": 11851,
+      "sha256": "89e3201558b3d24f3bfb08b6bd70fa88f1b57ba70a1741a9be13a41ac3f1c699"
+    },
+    {
+      "path": "compatibility.patch",
+      "bytes": 2543,
+      "sha256": "55d10f75f01edeeb8ec0cc18d31c981bcbfa7360d8abbe8b8a996613400bd9a6"
+    },
+    {
+      "path": "contract-audit.json",
+      "bytes": 6974,
+      "sha256": "9f8091d816b862708ddaaf6665f3c4b4f5fb30d0bac1c9610e13e3218bb019bf"
+    },
+    {
+      "path": "piper_start_ms_node_new.py",
+      "bytes": 38951,
+      "sha256": "398b12c773ab7e59a444daa232b14c6a344f75da14b9ce19e0cb32cb6cfdd026"
+    },
+    {
+      "path": "preflight_v3_feedback.py",
+      "bytes": 1343,
+      "sha256": "1f8c137a80d5c8327521683b0526948223792a9100c2fc32609e3b215e37bb5c"
+    },
+    {
+      "path": "prepare_follower_mode.py",
+      "bytes": 11357,
+      "sha256": "be59627418ef153adafdbd6b87c8b8efc46a63f66114ce105b10a749731d757f"
+    },
+    {
+      "path": "requirements-sdk-rollback.txt",
+      "bytes": 96,
+      "sha256": "da2bd7b2ad394f7cedbe773fd5a75049befc837ecee3b5ad252e10cc09cbbe07"
+    },
+    {
+      "path": "requirements-sdk-v3.txt",
+      "bytes": 98,
+      "sha256": "286067834ee0170c57ea15e9738facfd5f5d02206aa1faa73afe09c3e7fd3264"
+    },
+    {
+      "path": "rollback/piper_start_ms_node_new.py",
+      "bytes": 38945,
+      "sha256": "9c0e5340082885d0f74ffc8b0c7ecb1965af41f56adb1a5b98be93d111d868d9"
+    },
+    {
+      "path": "rollback/prepare_follower_mode.py",
+      "bytes": 11170,
+      "sha256": "433e716bd624503ecc3e5aaac14330d22c5700bb62548b30710b8a4e17ee3a41"
+    },
+    {
+      "path": "test_prepare_follower_mode.py",
+      "bytes": 12835,
+      "sha256": "876241adff843ab6c382751b93d3518db1b81c45524ba37bcf5a46813d889c2d"
+    }
+  ],
+  "current_host_firmware_verification": {
+    "host": "precision-5090",
+    "checked_at": "2026-11-23T18:26:59+08:00",
+    "request_id": "0x4AF",
+    "request_hex": "0100000000000000",
+    "receipt": "/tmp/dagger-can-identification-20261123T180758/live-firmware-query.json",
+    "adapters": {
+      "can_left_slave": {
+        "usb_serial": "004400414648571220363032",
+        "firmware": "S-V1.9-0260711"
+      },
+      "can_right_slave": {
+        "usb_serial": "004F003C4648570220393831",
+        "firmware": "S-V1.9-1260924"
+      },
+      "can_left_mas": {
+        "usb_serial": "001E003D4648570A20303731",
+        "firmware": "S-V1.9-0260714"
+      },
+      "can_right_mas": {
+        "usb_serial": "0037002F4648570A20303731",
+        "firmware": "S-V1.9-0260715"
+      }
+    },
+    "mode_enable_or_motion_commands_sent": 0
+  }
+}

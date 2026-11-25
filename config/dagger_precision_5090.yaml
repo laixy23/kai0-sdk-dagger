@@ -1,0 +1,156 @@
+# precision-5090 纯 SDK DAgger 配置（零 ROS，参考 inference-origin/client/config_agilex_3.yaml）
+runtime:
+  backend: sdk
+  inference_origin_root: /home/ubuntu/dev/inference-origin
+  python_bin: /home/ubuntu/dev/inference-origin/.venv-client/bin/python
+
+startup:
+  enabled: true
+  model_service: g05-orgnize-two-joint-step76000.service
+  release_ros_camera_service: kai0-official-cameras.service
+  model_timeout_s: 180
+  verify_can_serials: true
+  prepare_arms_current_pose: true
+
+server:
+  transport: websocket
+  host: 127.0.0.1
+  port: 8015
+
+can:
+  bitrate: 1000000
+  follower_left:
+    name: can_left_slave
+    serial: "004A003C4648571620303731"
+  follower_right:
+    name: can_right_slave
+    serial: "003000414648570A20303731"
+  master_left:
+    name: can_left_mas
+    serial: "002C002A4648570220393831"
+  master_right:
+    name: can_right_mas
+    serial: "001F00434648571720303731"
+
+camera:
+  enable: true
+  width: 640
+  height: 480
+  fps: 30
+  use_depth: false
+  front:
+    serial: "263022072158"
+    model_key: top_head
+    record_key: cam_high
+  right:
+    serial: "263022070473"
+    model_key: hand_right
+    record_key: cam_right_wrist
+  left:
+    serial: "263022071527"
+    model_key: hand_left
+    record_key: cam_left_wrist
+
+arm:
+  # 下发模型动作前对左右臂 J1..J6 加角度偏置（对齐 config_galaxea_dell.yaml）
+  joint_bias_deg:
+    left: [0, 0, 3, 0, 0, 0]
+    right: [0, 0, 3, 0, 0, 0]
+  gripper_bias_mm:
+    left: -2
+    right: -2
+  auto_enable: true
+  gripper_exist: true
+  gripper_multiple: 1.0
+  # policy 推理期间从臂控制模式：high_follow (200Hz 三次插值) | position (30Hz 直发)
+  control_mode: high_follow
+  right_offset: 0.003
+  command_velocity: 100
+  gripper_effort: 1000
+  high_follow:
+    control_hz: 200
+    max_queue_size: 32
+    max_joint_vel: [2.0, 2.0, 2.0, 2.5, 2.5, 2.5]
+    interpolator:
+      type: waypoint_cubic
+      tangent_mode: centripetal
+      monotone_projection: true
+      monotone_projection_dims: arm
+      duration_scale: 1.0
+      min_duration_s: 0.0
+      max_duration_s: 0.0
+  init_steps: 100
+  init_sleep_s: 0.01
+  init_action:
+    left: [0.0, 0.32, -0.36, 0.0, 0.24, 0.0, 0.07]
+    right: [0.0, 0.32, -0.36, 0.0, 0.24, 0.0, 0.07]
+  master_safe_pose:
+    left: [0.0, 0.30, -0.30, 0.0, 0.0, 0.0, 0.0]
+    right: [0.0, 0.30, -0.30, 0.0, 0.0, 0.0, 0.0]
+  master_align_duration_s: 3.0
+  master_hold_seconds: 3.0
+  master_align_tolerance_mdeg: 1000
+  master_align_velocity: 30
+  # 人工遥操（FA 直转）从臂控制模式：high_follow (0xAD，与推理一致，带限速平滑保护) | position (0x00)
+  fa_control_mode: high_follow
+  fa_forward_velocity: 100
+  fa_gripper_effort: 1000
+  # 100mm 示教器手柄（M-JXB2-130107-M）防碰撞检测：如主臂对齐时会碰到底座/桌面，先微调从臂至安全位再对齐
+  collision_avoid_steps: 60
+  collision_avoid_sleep_s: 0.01
+  master_handle_collision:
+    enabled: true
+    handle_axis: "+x"
+    handle_axial_z_m: 0.0345
+    handle_length_m: 0.130
+    handle_rod_radius_m: 0.012
+    handle_tip_radius_m: 0.018
+    base_center_xy_m: [-0.006, 0.0]
+    base_radius_m: 0.055
+    base_z_min_m: -0.020
+    base_z_max_m: 0.165
+    table_z_m: 0.015
+    safety_margin_m: 0.005
+    path_samples: 10
+    clip_follower_actions: true
+    clip_margin_extra_m: 0.003
+
+inference:
+  prompt: "Organize the clothes."
+  chunk_size: 32
+  publish_rate: 30
+  inference_rate: 3
+  num_denoising_steps: 10
+  latency_k: 8
+  min_smooth_steps: 8
+  image_size: 224
+  image_preprocessing: model
+  jpeg_roundtrip: false
+  max_obs_age_s: 0.5
+
+recording:
+  format: lerobot  # lerobot (LeRobot v2.1, Kai0 官方训练格式) | hdf5 (兼容旧格式)
+  robot_type: agilex
+  dataset_dir: /home/ubuntu/dev/kai0-sdk-dagger/data
+  task_name: aloha_mobile_dummy
+  frame_rate: 30
+  export_video: true
+  video_fps: 30
+  video_codec: libx264
+  video_preset: ultrafast
+  video_crf: 18
+  async_video_export: true
+  auto_merge_round: true
+  inference_tail_s: 1.0
+  dagger_preroll_s: 1.0
+  save_confirm_timeout_s: 10.0
+
+pedal:
+  config_path: /home/ubuntu/dev/kai0-sdk-dagger/_runtime/foot-pedal.json
+  standby_on_pedal_stop: true
+  double_click_window_s: 0.8
+
+voice:
+  enabled: true
+  volume: 0.85
+  prefer_sink_match: SPEAKER-Z

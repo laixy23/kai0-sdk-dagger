@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "device": {
+    "vendor": "16c0",
+    "product": "05e2",
+    "serial": "030032217487"
+  },
+  "bindings": {
+    "left": {
+      "interface": "usb-if00/input0/61a87ac352d4",
+      "code": 64,
+      "modifiers": [
+        29
+      ]
+    },
+    "right": {
+      "interface": "usb-if00/input0/61a87ac352d4",
+      "code": 66,
+      "modifiers": [
+        29
+      ]
+    }
+  },
+  "calibration": {
+    "method": "press_count",
+    "required_presses": 3,
+    "measured_press_counts": {
+      "left": 3,
+      "right": 3
+    },
+    "measured_press_durations_s": {
+      "left": [
+        0.008,
+        0.008,
+        0.008
+      ],
+      "right": [
+        0.007997000000614207,
+        0.007968999998411164,
+        0.008000999998330371
+      ]
+    },
+    "created_at_utc": "2026-11-23T12:36:50.984350+00:00",
+    "source": "captured real evdev key groups, physically labelled by the user",
+    "source_receipts": {
+      "left": "_deployment/two-pedal-left-combo-20261123.json",
+      "right": "_deployment/two-pedal-right-combo-20261123.json"
+    }
+  },
+  "actions": {
+    "left_single": "left",
+    "right_single": "save",
+    "left_double": "resume",
+    "right_double": "stop"
+  }
+}

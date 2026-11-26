@@ -1224,6 +1224,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self._closing = False
         self._last_log_count = 0
         self._last_round_error: str = ""
+        self._last_ui_mode: str | None = None
         self._standby_events: list[tuple[str, str, str]] = []
 
         self.setWindowTitle("Kai0 纯 SDK DAgger 采集工作台（零 ROS · LeRobot v2.1）")
@@ -1244,6 +1245,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
             self.history_tab.tags_panel.set_default_actor(collector_name)
         self.tabs.addTab(self.history_tab, "历史数据与缺口 (v2.1)")
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._sync_tab_ime(0)
 
         QtWidgets.QApplication.instance().installEventFilter(self)
 
@@ -1265,6 +1267,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(50, self.start_new_round)
 
     def _build_live_tab(self, collector_name: str | None) -> None:
+        self.live_page.setFocusPolicy(QtCore.Qt.StrongFocus)
         layout = QtWidgets.QVBoxLayout(self.live_page)
         layout.setContentsMargins(18, 12, 18, 12)
         layout.setSpacing(10)
@@ -1380,7 +1383,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self.btn_save.setObjectName("save")
         self.btn_save.clicked.connect(lambda: self.trigger_action("save"))
 
-        self.btn_delete = QtWidgets.QPushButton("撤销删除刚存段 (w)")
+        self.btn_delete = QtWidgets.QPushButton("撤销删除刚存段 (w / 退格)")
         self.btn_delete.setObjectName("delete_warn")
         self.btn_delete.clicked.connect(lambda: self.trigger_action("w"))
 
@@ -1407,7 +1410,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         for k, desc in (
             ("D / 左单", "人工接管 / 开始下段"),
             ("S / 右单", "保存纠正段"),
-            ("W", "10秒内撤销删除"),
+            ("W / 退格", "10秒内撤销删除"),
             ("R / 左双", "恢复模型 / 待机开新一轮"),
             ("右双", "结束本轮进待机"),
         ):
@@ -1475,7 +1478,35 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
             self.history_tab.tags_panel.set_default_actor(name)
         self._refresh_daily_stats()
 
+    _X11_SCANCODE_ACTIONS = {
+        40: "d",  # X11 evdev KEY_D
+        39: "s",  # X11 evdev KEY_S
+        25: "w",  # X11 evdev KEY_W
+        27: "r",  # X11 evdev KEY_R
+        65: " ",  # X11 evdev KEY_SPACE
+    }
+
+    def _sync_tab_ime(self, tab_idx: int) -> None:
+        # Disable OS IME (IBus/fcitx Chinese input) on Tab 0 so shortcuts like w/d/s/r
+        # are never swallowed into Pinyin preedit, while keeping Chinese input working on Tab 1.
+        live_active = (tab_idx == 0)
+        self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, not live_active)
+        self.tabs.setAttribute(QtCore.Qt.WA_InputMethodEnabled, not live_active)
+        self.live_page.setAttribute(QtCore.Qt.WA_InputMethodEnabled, False)
+        for child in self.live_page.findChildren(QtWidgets.QWidget):
+            if isinstance(child, QtWidgets.QLineEdit):
+                continue
+            if isinstance(child, QtWidgets.QPlainTextEdit) and not child.isReadOnly():
+                continue
+            child.setAttribute(QtCore.Qt.WA_InputMethodEnabled, False)
+
+    def _is_in_confirm_mode(self) -> bool:
+        if self.active_app is None:
+            return False
+        return self.active_app.get_ui_snapshot().get("mode") == "CONFIRM_SAVE"
+
     def _on_tab_changed(self, idx: int) -> None:
+        self._sync_tab_ime(idx)
         if idx == 1:
             self.history_tab.refresh()
         else:
@@ -1489,28 +1520,52 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self.log_box.appendPlainText(f"[{ts}] {msg}")
 
     def eventFilter(self, watched, event) -> bool:
-        if event.type() == QtCore.QEvent.KeyPress and not event.isAutoRepeat():
-            if not isinstance(watched, QtWidgets.QWidget) or watched.window() is not self:
-                return False
-            if self.tabs.currentIndex() != 0:
-                return False
-            if isinstance(watched, QtWidgets.QLineEdit):
-                return False
-            if isinstance(watched, QtWidgets.QPlainTextEdit) and not watched.isReadOnly():
-                return False
-            if event.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier):
-                return False
-            key_map = {
-                QtCore.Qt.Key_D: "d",
-                QtCore.Qt.Key_S: "s",
-                QtCore.Qt.Key_W: "w",
-                QtCore.Qt.Key_R: "r",
-                QtCore.Qt.Key_Space: " ",
-            }
-            act = key_map.get(event.key())
-            if act is not None:
-                self.trigger_action(act)
+        etype = event.type()
+        if etype not in (QtCore.QEvent.KeyPress, QtCore.QEvent.InputMethod):
+            return super().eventFilter(watched, event)
+        if not isinstance(watched, QtWidgets.QWidget) or watched.window() is not self:
+            return False
+        if self.tabs.currentIndex() != 0:
+            return False
+        if isinstance(watched, QtWidgets.QLineEdit):
+            return False
+        if isinstance(watched, QtWidgets.QPlainTextEdit) and not watched.isReadOnly():
+            return False
+
+        if etype == QtCore.QEvent.InputMethod:
+            im_text = f"{event.preeditString()}{event.commitString()}".strip().lower()
+            if "w" in im_text and self._is_in_confirm_mode():
+                self.trigger_action("w")
                 return True
+            return False
+
+        if event.isAutoRepeat():
+            return False
+        if event.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier):
+            return False
+
+        key_map = {
+            QtCore.Qt.Key_D: "d",
+            QtCore.Qt.Key_S: "s",
+            QtCore.Qt.Key_W: "w",
+            QtCore.Qt.Key_R: "r",
+            QtCore.Qt.Key_Space: " ",
+        }
+        act = key_map.get(event.key())
+        if act is None:
+            txt = event.text().strip().lower()
+            if txt in ("d", "s", "w", "r"):
+                act = txt
+        if act is None and sys.platform.startswith("linux"):
+            scan = int(event.nativeScanCode() or 0)
+            if scan > 0:
+                act = self._X11_SCANCODE_ACTIONS.get(scan)
+        if act is None and event.key() in (QtCore.Qt.Key_Backspace, QtCore.Qt.Key_Delete):
+            if self._is_in_confirm_mode():
+                act = "w"
+        if act is not None:
+            self.trigger_action(act)
+            return True
         return super().eventFilter(watched, event)
 
     def trigger_action(self, action: str) -> None:
@@ -1583,6 +1638,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
     def _refresh_ui(self) -> None:
         app = self.active_app
         if app is None:
+            self._last_ui_mode = None
             self.status_badge.setText("● 待机中（等待下一轮）")
             self.status_badge.setStyleSheet(
                 "background: #1d2c3d; color: #9fc4e6; border-radius: 7px; padding: 8px 14px; font-weight: 700;"
@@ -1603,7 +1659,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
             self.btn_takeover.setEnabled(False)
             self.btn_save.setEnabled(False)
             self.btn_delete.setEnabled(False)
-            self.btn_delete.setText("撤销删除刚存段 (w)")
+            self.btn_delete.setText("撤销删除刚存段 (w / 退格)")
             self.btn_confirm.setEnabled(False)
             self.btn_resume.setEnabled(False)
             self.btn_stop_round.setEnabled(False)
@@ -1617,6 +1673,12 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         ready = snap["ready"]
         stopping = snap["stopping"]
         in_handoff = snap["in_exit_handoff"]
+
+        if mode == "CONFIRM_SAVE" and self._last_ui_mode != "CONFIRM_SAVE":
+            self.raise_()
+            self.activateWindow()
+            self.live_page.setFocus(QtCore.Qt.ActiveWindowFocusReason)
+        self._last_ui_mode = mode
 
         if self.pedal_worker is not None:
             self.pedal_worker.set_allow_short(ready and (not stopping or mode == "CONFIRM_SAVE"))
@@ -1742,13 +1804,13 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self.btn_delete.setEnabled(in_confirm)
         if in_confirm:
             if confirm_target == "round":
-                self.btn_delete.setText(f"丢弃整轮数据 ({snap['confirm_remaining_s']:.1f}s · w)")
+                self.btn_delete.setText(f"丢弃整轮数据 ({snap['confirm_remaining_s']:.1f}s · w/退格)")
                 self.btn_confirm.setText("确认保留整轮 (其他键/踏板)")
             else:
-                self.btn_delete.setText(f"撤销删除{confirm_kind_zh} ({snap['confirm_remaining_s']:.1f}s · w)")
+                self.btn_delete.setText(f"撤销删除{confirm_kind_zh} ({snap['confirm_remaining_s']:.1f}s · w/退格)")
                 self.btn_confirm.setText("立即确认保留 (其他键/踏板)")
         else:
-            self.btn_delete.setText("撤销删除刚存段 (w)")
+            self.btn_delete.setText("撤销删除刚存段 (w / 退格)")
             self.btn_confirm.setText("立即确认保留 (其他键/踏板)")
         self.btn_confirm.setEnabled(in_confirm)
         self.btn_resume.setEnabled(ready and not stopping and not in_handoff and mode in ("DAGGER_RECORDING", "DAGGER_PAUSED"))

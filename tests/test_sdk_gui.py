@@ -806,5 +806,80 @@ class SDKDaggerGUITests(unittest.TestCase):
                 self.qapp.processEvents()
 
 
+    def test_ime_immune_delete_shortcuts_and_tab_ime_isolation(self):
+        from PyQt5 import QtCore, QtGui, QtWidgets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = _fast_gui_cfg(tmp_path)
+            win = SDKDaggerMainWindow(
+                cfg,
+                dataset_dir=tmp_path,
+                mock=True,
+                enable_pedal=False,
+                auto_start=False,
+            )
+            try:
+                # Layer 1: Tab 0 disables IME on window/tabs/live_page/children; Tab 1 restores IME
+                self.assertFalse(win.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+                self.assertFalse(win.tabs.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+                self.assertFalse(win.live_page.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+                self.assertFalse(win.log_box.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+                self.assertFalse(win.btn_delete.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+
+                win.tabs.setCurrentIndex(1)
+                self.qapp.processEvents()
+                self.assertTrue(win.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+                self.assertTrue(win.tabs.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+                if hasattr(win.history_tab, "tags_panel"):
+                    edits = win.history_tab.tags_panel.findChildren(QtWidgets.QLineEdit)
+                    self.assertTrue(len(edits) >= 1)
+                    for ed in edits:
+                        self.assertTrue(ed.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+
+                win.tabs.setCurrentIndex(0)
+                self.qapp.processEvents()
+                self.assertFalse(win.testAttribute(QtCore.Qt.WA_InputMethodEnabled))
+
+                # Stub active_app to test Layer 2 shortcut fallbacks deterministically
+                actions: list[str] = []
+                mode_box = {"mode": "INFERENCE"}
+
+                class _DummyApp:
+                    def get_ui_snapshot(self):
+                        return {"mode": mode_box["mode"]}
+
+                    def handle_operator_action(self, action: str, source: str = "gui"):
+                        actions.append(action)
+
+                win.active_app = _DummyApp()
+                win._refresh_ui = lambda: None
+
+                # Backspace/Delete do NOT trigger 'w' outside CONFIRM_SAVE
+                bs_ev = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Backspace, QtCore.Qt.NoModifier)
+                self.assertFalse(win.eventFilter(win.live_page, bs_ev))
+                self.assertEqual(actions, [])
+
+                # Hardware X11 scancode fallback (25 == W) works even when key is Key_unknown
+                scan_w = QtGui.QKeyEvent(
+                    QtCore.QEvent.KeyPress, QtCore.Qt.Key_unknown, QtCore.Qt.NoModifier, 25, 0, 0, ""
+                )
+                self.assertTrue(win.eventFilter(win.live_page, scan_w))
+                self.assertEqual(actions, ["w"])
+                actions.clear()
+
+                # During CONFIRM_SAVE: Backspace, Delete, and InputMethod preedit 'w' all trigger 'w'
+                mode_box["mode"] = "CONFIRM_SAVE"
+                self.assertTrue(win.eventFilter(win.live_page, bs_ev))
+                del_ev = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Delete, QtCore.Qt.NoModifier)
+                self.assertTrue(win.eventFilter(win.live_page, del_ev))
+                im_ev = QtGui.QInputMethodEvent("w", [])
+                self.assertTrue(win.eventFilter(win.live_page, im_ev))
+                self.assertEqual(actions, ["w", "w", "w"])
+            finally:
+                win.active_app = None
+                win.close()
+                self.qapp.processEvents()
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import av
 import h5py
@@ -51,6 +51,7 @@ class VideoExportJob:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
     error: Exception | None = None
+    on_complete: Callable[[], None] | None = None
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -156,6 +157,14 @@ class AsyncVideoExporter:
                             f"\033[32m[后台视频] episode_{job.episode_idx:06d} 三路视频导出完成（耗时 {time.monotonic() - t0:.2f} 秒）\033[0m",
                             flush=True,
                         )
+                        if job.on_complete is not None:
+                            try:
+                                job.on_complete()
+                            except Exception as vexc:
+                                print(
+                                    f"\033[31m[校验失败] episode_{job.episode_idx:06d} 读回校验异常：{vexc}\033[0m",
+                                    flush=True,
+                                )
             except Exception as exc:
                 job.error = exc
                 print(f"\033[31m[后台视频] episode_{job.episode_idx:06d} 导出失败：{exc}\033[0m", flush=True)
@@ -529,6 +538,18 @@ class LeRobotV21DatasetWriter:
 
         print(f"\033[32mLeRobot Parquet 保存完成（耗时 {time.monotonic() - t0:.2f} 秒）：{parquet_path}\033[0m", flush=True)
 
+        def _verify_and_write_receipt(*, check_vid: bool) -> None:
+            from sdk_dagger.verify import verify_episode_v21, write_save_receipt
+            rep = verify_episode_v21(
+                self.root_dir, ep_idx, expected_frames=num_frames, check_video=check_vid
+            )
+            write_save_receipt(self.root_dir, ep_idx, rep)
+            if rep.get("warnings"):
+                print(
+                    f"\033[33m[校验通过·含提示] {self.root_dir.name}/episode_{ep_idx:06d}（{num_frames} 帧）：{'; '.join(rep['warnings'])}\033[0m",
+                    flush=True,
+                )
+
         video_paths: list[Path] = []
         video_job: VideoExportJob | None = None
         if export_video:
@@ -549,6 +570,7 @@ class LeRobotV21DatasetWriter:
                     preset=self.video_preset,
                     crf=self.video_crf,
                     video_paths=expected_paths,
+                    on_complete=lambda: _verify_and_write_receipt(check_vid=True),
                 )
                 self.video_exporter.submit(video_job)
                 video_paths = expected_paths
@@ -559,6 +581,15 @@ class LeRobotV21DatasetWriter:
                     tasks, fps=self.fps, codec=self.video_codec, preset=self.video_preset, crf=self.video_crf
                 )
                 print(f"\033[32m全部视频导出完成（总耗时 {time.monotonic() - t0:.2f} 秒）\033[0m", flush=True)
+                try:
+                    _verify_and_write_receipt(check_vid=True)
+                except Exception as vexc:
+                    print(f"\033[31m[校验失败] episode_{ep_idx:06d} 读回校验异常：{vexc}\033[0m", flush=True)
+        else:
+            try:
+                _verify_and_write_receipt(check_vid=False)
+            except Exception as vexc:
+                print(f"\033[31m[校验失败] episode_{ep_idx:06d} 读回校验异常：{vexc}\033[0m", flush=True)
 
         return {
             "saved": True,
@@ -592,6 +623,9 @@ class LeRobotV21DatasetWriter:
             if Path(vp).exists():
                 Path(vp).unlink()
                 print(f"\033[33m已删除视频文件：{vp}\033[0m", flush=True)
+        if ep_idx is not None:
+            from sdk_dagger.verify import delete_save_receipt
+            delete_save_receipt(self.root_dir, int(ep_idx))
         with self._lock:
             self._episodes = [ep for ep in self._episodes if int(ep["episode_index"]) != ep_idx]
             self._episodes_stats = [st for st in self._episodes_stats if int(st["episode_index"]) != ep_idx]
@@ -1068,8 +1102,29 @@ def merge_round_lerobot_v21(
         f"\033[32m[自动拼接] LeRobot v2.1 连续片段已生成（共 {total_ep} 段 / {global_idx} 帧，耗时 {elapsed:.2f} 秒）：{out_root}\033[0m",
         flush=True,
     )
+    verification: dict[str, Any] | None = None
+    verified = False
+    try:
+        from sdk_dagger.verify import verify_dataset_v21
+        verification = verify_dataset_v21(out_root, write_receipts=True, check_video=export_video)
+        verified = bool(verification.get("passed"))
+        if verified:
+            wtxt = f"（提示：{'; '.join(verification['warnings'])}）" if verification.get("warnings") else ""
+            print(
+                f"\033[32m[校验通过] 拼接数据集读回校验完成（{total_ep} 段 / {global_idx} 帧，已写 save_receipts 回执）{wtxt}\033[0m",
+                flush=True,
+            )
+        else:
+            print(
+                f"\033[31m[校验失败] 拼接数据集存在异常：{'; '.join(verification.get('errors') or [])}\033[0m",
+                flush=True,
+            )
+    except Exception as vexc:
+        print(f"\033[31m[校验失败] 拼接数据集读回校验异常：{vexc}\033[0m", flush=True)
     return {
         "merged": True,
+        "verified": verified,
+        "verification": verification,
         "episodes": total_ep,
         "frames": global_idx,
         "merged_dir": str(out_root),

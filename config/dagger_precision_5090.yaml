@@ -118,7 +118,7 @@ arm:
 inference:
   prompt: "Organize the clothes."
   chunk_size: 32
-  publish_rate: 30
+  publish_rate: 25
   inference_rate: 3
   num_denoising_steps: 10
   latency_k: 8

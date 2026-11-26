@@ -26,6 +26,7 @@ VOICE_PROMPTS: dict[str, str] = {
     "resumed": "已恢复模型运行",
     "stopping": "正在停止并保存本轮数据",
     "standby": "本轮已保存完成，进入待机",
+    "camera_error": "警告，相机画面中断，已停止录帧，请检查接线",
     "voice_test": "中文语音播报正常",
 }
 

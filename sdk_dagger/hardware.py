@@ -198,6 +198,36 @@ class SDKDaggerRig:
             images_bgr=images_bgr,
         )
 
+    def get_camera_health(self) -> dict[str, dict[str, Any]]:
+        """Return per-camera latest frame age & stale flag (O(1) read-only check)."""
+        role_map = (
+            ("front", "cam_high", "正面相机"),
+            ("left", "cam_left_wrist", "左腕相机"),
+            ("right", "cam_right_wrist", "右腕相机"),
+        )
+        now = time.time()
+        out: dict[str, dict[str, Any]] = {}
+        cams = getattr(self.cameras, "cameras", None) if self.cameras is not None else None
+        for role, rec_key, label in role_map:
+            serial = str((self.cam_cfg.get(role) or {}).get("serial", "")) if isinstance(self.cam_cfg, dict) else ""
+            cam_obj = cams.get(role) if isinstance(cams, dict) else None
+            ts = None
+            if cam_obj is not None:
+                try:
+                    ts = cam_obj.latest_timestamp()
+                except Exception:
+                    ts = None
+            age_s = max(0.0, now - float(ts)) if ts is not None else None
+            out[rec_key] = {
+                "role": role,
+                "label": label,
+                "serial": serial,
+                "timestamp": float(ts) if ts is not None else None,
+                "age_s": age_s,
+                "stale": bool(age_s is not None and age_s > 2.0),
+            }
+        return out
+
     def read_follower_qpos(self) -> np.ndarray:
         lq, _, _, _ = _read_piper_arm_full_state(self.followers.left)
         rq, _, _, _ = _read_piper_arm_full_state(self.followers.right)

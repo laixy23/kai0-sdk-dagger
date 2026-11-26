@@ -92,7 +92,7 @@ class SDKDaggerGUITests(unittest.TestCase):
                 mock=True,
                 enable_pedal=False,
                 auto_start=False,
-                collector_name="collector_1",
+                collector_name="徐鑫鑫",
             )
             try:
                 # Initially in safe STANDBY
@@ -164,8 +164,8 @@ class SDKDaggerGUITests(unittest.TestCase):
                 win.history_tab.ds_list.setCurrentRow(dag_row)
                 self.qapp.processEvents()
                 self.assertEqual(win.history_tab.ep_table.rowCount(), 1)
-                self.assertIn("attempt#0", win.history_tab.ep_table.item(0, 3).text())
-                self.assertEqual(win.history_tab.ep_table.item(0, 5).text(), "collector_1")
+                self.assertIn("attempt#0", win.history_tab.ep_table.item(0, 5).text())
+                self.assertEqual(win.history_tab.ep_table.item(0, 7).text(), "徐鑫鑫")
                 self.assertIn("已删除缺口", win.history_tab.timeline_box.toPlainText())
                 self.assertIsNotNone(win.history_tab.cam_cards["cam_high"]._pixmap)
             finally:
@@ -351,6 +351,239 @@ class SDKDaggerGUITests(unittest.TestCase):
         self.assertGreaterEqual(flaky.attempts, 2)
         self.assertTrue(any((not ok and "自动重试中" in txt) for ok, txt in statuses))
         self.assertTrue(any((ok and "双踏板已连接" in txt) for ok, txt in statuses))
+
+
+    def test_daily_merged_rounds_counter_and_history_summary(self):
+        """Live workbench KPI card and history tab summary must count valid on-disk *_merged rounds by date and collector."""
+        import datetime, json, tempfile
+        from pathlib import Path
+        import yaml
+        from PyQt5 import QtWidgets
+        from sdk_dagger.gui import (
+            SDKDaggerMainWindow,
+            format_daily_summary_banner,
+            summarize_daily_merged_rounds,
+        )
+        from sdk_dagger.voice import VoiceAnnouncer
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        today = datetime.date.today()
+        today_compact = today.strftime("%Y%m%d")
+        yest_compact = (today - datetime.timedelta(days=1)).strftime("%Y%m%d")
+
+        def _make_merged(root_dir: Path, name: str, *, episodes: int, frames: int, collector: str | None = None):
+            meta = root_dir / name / "meta"
+            meta.mkdir(parents=True, exist_ok=True)
+            (meta / "info.json").write_text(
+                json.dumps({"total_episodes": episodes, "total_frames": frames, "fps": 30}),
+                encoding="utf-8",
+            )
+            ep = {"episode_index": 0, "length": frames}
+            if collector:
+                ep["collector_name"] = collector
+            (meta / "episodes.jsonl").write_text(json.dumps(ep, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            td = Path(tmp)
+            # Valid today rounds (2 total: 1 郑进宝, 1 赖星羽)
+            _make_merged(td, f"cloth_sdk_{today_compact}_100001_100_r1_merged", episodes=1, frames=120, collector="郑进宝")
+            _make_merged(td, f"cloth_sdk_{today_compact}_100501_100_r2_merged", episodes=1, frames=150, collector="赖星羽")
+            # Invalid empty round today (0 frames) + non-merged dirs must NOT be counted
+            _make_merged(td, f"cloth_sdk_{today_compact}_100601_100_r3_merged", episodes=0, frames=0, collector="郑进宝")
+            _make_merged(td, f"cloth_sdk_{today_compact}_100001_100_r1_inference", episodes=1, frames=120, collector="郑进宝")
+            # Valid yesterday rounds (3 total)
+            for i in range(1, 4):
+                _make_merged(td, f"cloth_sdk_{yest_compact}_18000{i}_200_r{i}_merged", episodes=1, frames=200)
+
+            summary = summarize_daily_merged_rounds(td, today=today)
+            self.assertEqual(summary["today_rounds"], 2)
+            self.assertEqual(summary["yesterday_rounds"], 3)
+            self.assertEqual(summary["today_by_collector"], {"郑进宝": 1, "赖星羽": 1})
+            banner = format_daily_summary_banner(summary)
+            self.assertIn(f"今日 {today.isoformat()}：2 轮", banner)
+            self.assertIn(f"昨日 {(today - datetime.timedelta(days=1)).isoformat()}：3 轮", banner)
+
+            cfg = yaml.safe_load(Path("config/dagger_precision_5090.yaml").read_text(encoding="utf-8"))
+            cfg.setdefault("recording", {})["dataset_dir"] = str(td)
+            win = SDKDaggerMainWindow(cfg, mock=True, voice=VoiceAnnouncer(enabled=False))
+            try:
+                self.assertEqual(win.metrics["daily"].text(), "2 轮")
+                # Switch collector to 郑进宝 -> updates live card immediately
+                idx = win.collector_combo.findData("郑进宝")
+                self.assertGreaterEqual(idx, 0)
+                win.collector_combo.setCurrentIndex(idx)
+                self.assertEqual(win.metrics["daily"].text(), "2 轮（郑进宝 1）")
+                # History tab summary banner matches
+                win.history_tab.refresh()
+                self.assertIn(f"今日 {today.isoformat()}：2 轮", win.history_tab.daily_summary_label.text())
+                self.assertIn(f"昨日 {(today - datetime.timedelta(days=1)).isoformat()}：3 轮", win.history_tab.daily_summary_label.text())
+            finally:
+                win.close()
+
+
+    def test_verify_receipts_and_episode_quality_tags_in_gui(self):
+        """Auto save receipts, manual read-back verification, and piper_ms_teleop-style quality tagging update both tabs."""
+        import datetime, tempfile
+        from pathlib import Path
+        import numpy as np
+        import yaml
+        from PyQt5 import QtWidgets
+        from sdk_dagger.episode_tags import read_tags, save_tags
+        from sdk_dagger.gui import SDKDaggerMainWindow
+        from sdk_dagger.storage import FrameSample, LeRobotV21DatasetWriter, merge_round_lerobot_v21
+        from sdk_dagger.verify import read_save_receipts, verify_dataset_v21
+        from sdk_dagger.voice import VoiceAnnouncer
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        today_compact = datetime.date.today().strftime("%Y%m%d")
+
+        def _make_samples(n: int) -> list[FrameSample]:
+            out = []
+            for i in range(n):
+                img = np.full((64, 80, 3), 100 + i * 2, dtype=np.uint8)
+                q = np.linspace(0.0, 0.2, 14, dtype=np.float32) + i * 0.005
+                out.append(FrameSample(
+                    timestamp=1000.0 + i / 30.0,
+                    qpos=q,
+                    qvel=np.zeros(14, dtype=np.float32),
+                    effort=np.zeros(14, dtype=np.float32),
+                    images_bgr={"cam_high": img, "cam_left_wrist": img, "cam_right_wrist": img},
+                ))
+            return out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            td = Path(tmp)
+            prefix = f"cloth_sdk_{today_compact}_120000_999_r1"
+            inf_dir = td / f"{prefix}_inference"
+            dag_dir = td / f"{prefix}_dagger"
+            mrg_dir = td / f"{prefix}_merged"
+
+            w_inf = LeRobotV21DatasetWriter(inf_dir, prompt="Organize", fps=30)
+            r_inf = w_inf.save_episode(_make_samples(12), export_video=True, collector_name="郑进宝")
+            self.assertTrue(r_inf["saved"])
+            # Auto read-back receipt created on save
+            inf_receipts = read_save_receipts(inf_dir)
+            self.assertIn(0, inf_receipts)
+            self.assertTrue(inf_receipts[0]["passed"])
+
+            mres = merge_round_lerobot_v21(
+                inference_dir=inf_dir,
+                dagger_dir=dag_dir,
+                merged_dir=mrg_dir,
+                stitch_events=[{"kind": "segment", "source": "inference", "episode_index": 0}],
+                prompt="Organize",
+                fps=30,
+                export_video=True,
+                collector_name="郑进宝",
+            )
+            self.assertTrue(mres["merged"])
+            self.assertTrue(mres["verified"])
+            self.assertTrue(read_save_receipts(mrg_dir)[0]["passed"])
+
+            # Offline CLI/API verifier passes
+            vrep = verify_dataset_v21(mrg_dir, write_receipts=False)
+            self.assertTrue(vrep["passed"])
+
+            # Optimistic revision lock on episode_tags
+            row1 = save_tags(mrg_dir, 0, quality="usable", tags=["操作失误"], note="ok", actor="郑进宝", expected_revision=0)
+            self.assertEqual(row1["revision"], 1)
+            with self.assertRaises(ValueError):
+                save_tags(mrg_dir, 0, quality="unusable", actor="郑进宝", expected_revision=0)
+
+            # GUI History tab shows verified badge and tagging updates live daily counter
+            cfg = yaml.safe_load(Path("config/dagger_precision_5090.yaml").read_text(encoding="utf-8"))
+            cfg.setdefault("recording", {})["dataset_dir"] = str(td)
+            win = SDKDaggerMainWindow(cfg, mock=True, voice=VoiceAnnouncer(enabled=False))
+            try:
+                self.assertEqual(win.metrics["daily"].text(), "1 轮")
+                win.history_tab.refresh()
+                # Find merged dataset in list
+                mrg_row = next(i for i, d in enumerate(win.history_tab._datasets) if d["name"] == mrg_dir.name)
+                win.history_tab.ds_list.setCurrentRow(mrg_row)
+                self.assertIn("✅", win.history_tab.ds_list.item(mrg_row).text())
+                self.assertIn("✅", win.history_tab.ep_table.item(0, 2).text())
+
+                # Mark episode 0 as unusable with preset tag via UI panel
+                win.history_tab.tags_panel.quality.setCurrentIndex(
+                    win.history_tab.tags_panel.quality.findData("unusable")
+                )
+                win.history_tab.tags_panel.add_preset(1)  # 画面异常
+                win.history_tab.tags_panel.note.setText("左腕短暂遮挡")
+                win.history_tab.tags_panel.store()
+
+                doc = read_tags(mrg_dir)
+                self.assertEqual(doc["episodes"]["0"]["quality"], "unusable")
+                self.assertIn("画面异常", doc["episodes"]["0"]["tags"])
+                # Live KPI card and history banner immediately reflect 可用 0
+                self.assertIn("可用 0", win.metrics["daily"].text())
+                self.assertIn("不可用 1", win.history_tab.daily_summary_label.text())
+                self.assertIn("🚫不可用:1", win.history_tab.ds_list.item(mrg_row).text())
+            finally:
+                win.close()
+
+
+    def test_camera_stall_and_zero_frame_save_show_prominent_red_gui_alert(self):
+        """Stale/disconnected camera must trigger prominent red status badge, red guide banner, red camera card overlay, and explicit 0-frame save alert."""
+        import tempfile, time
+        from pathlib import Path
+        import numpy as np
+        import yaml
+        from PyQt5 import QtWidgets
+        from sdk_dagger.app import SDKDaggerApp
+        from sdk_dagger.gui import SDKDaggerMainWindow
+        from sdk_dagger.storage import FrameSample
+        from sdk_dagger.voice import VoiceAnnouncer
+
+        _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = yaml.safe_load(Path("config/dagger_precision_5090.yaml").read_text(encoding="utf-8"))
+            cfg.setdefault("recording", {})["dataset_dir"] = tmp
+            spoken = []
+            voice = VoiceAnnouncer(enabled=True, runner=lambda key, wav, txt: spoken.append(key))
+            win = SDKDaggerMainWindow(cfg, mock=True, voice=voice)
+            try:
+                app = SDKDaggerApp(cfg, dataset_name="cam_alert_test", dataset_dir=tmp, mock=True, enable_terminal_input=False, voice=voice)
+                img = np.full((64, 80, 3), 120, dtype=np.uint8)
+                stale_sample = FrameSample(
+                    timestamp=time.time() - 12.5,
+                    qpos=np.zeros(14, dtype=np.float32),
+                    qvel=np.zeros(14, dtype=np.float32),
+                    effort=np.zeros(14, dtype=np.float32),
+                    images_bgr={"cam_high": img, "cam_left_wrist": img, "cam_right_wrist": img},
+                )
+                app._ready = True
+                app.mode = "DAGGER_RECORDING"
+                app._latest_sample = stale_sample
+                app._obs_error = "Frame didn'''t arrive within 5000"
+                # Simulate ONLY left wrist camera stalled while front & right wrist are healthy!
+                app.rig.get_camera_health = lambda: {
+                    "cam_high": {"role": "front", "label": "正面相机", "serial": "263022072158", "age_s": 0.03, "stale": False},
+                    "cam_left_wrist": {"role": "left", "label": "左腕相机", "serial": "263022071527", "age_s": 12.5, "stale": True},
+                    "cam_right_wrist": {"role": "right", "label": "右腕相机", "serial": "263022070473", "age_s": 0.03, "stale": False},
+                }
+                win.active_app = app
+                win._refresh_ui()
+
+                self.assertIn("左腕相机中断", win.status_badge.text())
+                self.assertIn("左腕相机", win.guide_banner.text())
+                self.assertIn("263022071527", win.guide_banner.text())
+                self.assertIn("无法保存", win.guide_banner.text())
+                # Only the faulty left wrist camera card turns red; healthy front stays normal green!
+                self.assertIn("画面中断", win.cam_cards["cam_left_wrist"].health.text())
+                self.assertIn("#ff4d5a", win.cam_cards["cam_left_wrist"].styleSheet())
+                self.assertIn("实时", win.cam_cards["cam_high"].health.text())
+                self.assertEqual(win.cam_cards["cam_high"].styleSheet(), "")
+
+                res = app._save_dagger_segment()
+                self.assertFalse(res["saved"])
+                deadline = time.monotonic() + 1.0
+                while "camera_error" not in spoken and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertIn("camera_error", spoken)
+                self.assertIn("不会进入 10 秒删除确认", app.get_ui_snapshot()["status_message"])
+            finally:
+                win.active_app = None
+                win.close()
 
 
 if __name__ == "__main__":

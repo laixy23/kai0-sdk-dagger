@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import getpass
 import json
 import math
 import os
+import re
 from pathlib import Path
 import select
 import signal
@@ -37,13 +39,14 @@ if str(ROOT / "operator") not in sys.path:
 from foot_pedal_device import FootPedalDevice, PedalGestures, load_config as load_pedal_config
 from sdk_dagger.app import SDKDaggerApp
 from sdk_dagger.prepare import load_config
+from sdk_dagger.episode_tags import PRESETS, QUALITY, read_tags, save_tags, summarize_dataset_quality
 from sdk_dagger.storage import CAMERA_NAMES, LEROBOT_CAMERA_KEYS
+from sdk_dagger.verify import dataset_receipt_status, read_save_receipts, verify_dataset_v21
 from sdk_dagger.voice import VoiceAnnouncer
 
 DEFAULT_COLLECTORS = (
-    "collector_1",
-    "collector_2",
-    "collector_3",
+    "徐鑫鑫", "郑进宝", "梁红宇", "黎子琪", "杨明壮",
+    "王海强", "李富春", "唐亚飞", "张翔宇",
 )
 
 STYLE = """
@@ -149,21 +152,91 @@ class CameraPreviewCard(QtWidgets.QFrame):
         foot.addWidget(self.detail)
         box.addLayout(foot)
 
-    def set_bgr(self, bgr: np.ndarray, *, age_s: float | None = None) -> None:
+    def _set_alert_border(self, level: str) -> None:
+        if level == "error":
+            self.setStyleSheet(
+                "QFrame { background: #2c1217; border: 2px solid #ff4d5a; border-radius: 10px; }"
+            )
+        elif level == "warn":
+            self.setStyleSheet(
+                "QFrame { background: #261e12; border: 2px solid #f5b864; border-radius: 10px; }"
+            )
+        else:
+            self.setStyleSheet("")
+
+    @staticmethod
+    def _paint_fault_overlay(pixmap: QtGui.QPixmap, headline: str, subline: str) -> QtGui.QPixmap:
+        out = QtGui.QPixmap(pixmap)
+        p = QtGui.QPainter(out)
+        try:
+            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            w, h = out.width(), out.height()
+            p.fillRect(0, 0, w, h, QtGui.QColor(110, 12, 20, 95))
+            bar_h = max(72, int(h * 0.30))
+            bar_y = (h - bar_h) // 2
+            p.fillRect(0, bar_y, w, bar_h, QtGui.QColor(184, 24, 38, 225))
+            pen_border = QtGui.QPen(QtGui.QColor("#ff99a1"), 2)
+            p.setPen(pen_border)
+            p.drawLine(0, bar_y, w, bar_y)
+            p.drawLine(0, bar_y + bar_h, w, bar_y + bar_h)
+            p.setPen(QtGui.QColor("#ffffff"))
+            f_big = QtGui.QFont()
+            f_big.setPixelSize(max(20, int(h * 0.068)))
+            f_big.setBold(True)
+            p.setFont(f_big)
+            p.drawText(
+                QtCore.QRect(12, bar_y + 8, w - 24, bar_h // 2),
+                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+                headline,
+            )
+            f_sub = QtGui.QFont()
+            f_sub.setPixelSize(max(14, int(h * 0.042)))
+            f_sub.setBold(True)
+            p.setFont(f_sub)
+            p.setPen(QtGui.QColor("#ffe2e5"))
+            p.drawText(
+                QtCore.QRect(12, bar_y + bar_h // 2, w - 24, bar_h // 2 - 6),
+                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+                subline,
+            )
+        finally:
+            p.end()
+        return out
+
+    def set_bgr(self, bgr: np.ndarray, *, age_s: float | None = None, obs_error: str | None = None) -> None:
         qimg = _bgr_to_qimage(bgr)
-        self._pixmap = QtGui.QPixmap.fromImage(qimg)
-        self._rescale()
+        pix = QtGui.QPixmap.fromImage(qimg)
         h, w = bgr.shape[:2]
-        if age_s is None:
+        severe = bool(obs_error) or (age_s is not None and age_s > 2.0)
+        warn = (not severe) and (age_s is not None and age_s > 1.0)
+        if severe:
+            age_txt = f"{age_s:.1f} 秒" if age_s is not None else "中断"
+            pix = self._paint_fault_overlay(
+                pix,
+                f"⚠ {self._title}中断（已停更 {age_txt}）",
+                "当前无法录帧 · 请检查该相机 USB 线后结束本轮重开",
+            )
+            self._set_alert_border("error")
+            self.health.setText(f"❌ 画面中断 {age_txt}（未录帧）")
+            self.health.setStyleSheet("color: #ff6b78; font-weight: 700;")
+        elif warn:
+            self._set_alert_border("warn")
+            self.health.setText(f"⚠ 画面延迟  {age_s * 1000:.0f} ms")
+            self.health.setStyleSheet("color: #f5b864; font-weight: 700;")
+        elif age_s is None:
+            self._set_alert_border("normal")
             self.health.setText("● 已加载")
             self.health.setStyleSheet("color: #72e5c3;")
         else:
-            stale = age_s > 1.0
-            self.health.setText(f'● {"画面停更" if stale else "实时"}  {age_s * 1000:.0f} ms')
-            self.health.setStyleSheet(f'color: {"#efae79" if stale else "#72e5c3"};')
+            self._set_alert_border("normal")
+            self.health.setText(f"● 实时  {age_s * 1000:.0f} ms")
+            self.health.setStyleSheet("color: #72e5c3;")
+        self._pixmap = pix
+        self._rescale()
         self.detail.setText(f"{w}×{h}  ·  双击放大")
 
     def clear_frame(self, text: str = "待机中（启动新一轮后显示实时画面）") -> None:
+        self._set_alert_border("normal")
         self._pixmap = None
         self.view.clear()
         self.view.setText(text)
@@ -393,15 +466,21 @@ def scan_lerobot_v21_datasets(root_dir: str | Path) -> list[dict[str, Any]]:
                             collision_cnt += 1
                     except Exception:
                         pass
+        ep_cnt = int(info.get("total_episodes", 0))
+        r_stat = dataset_receipt_status(ds_dir, total_episodes=ep_cnt)
+        q_stat = summarize_dataset_quality(ds_dir, total_episodes=ep_cnt)
         found.append({
             "path": str(ds_dir),
             "name": ds_dir.name,
             "kind": "拼接" if ds_dir.name.endswith("_merged") else ("DAgger" if ds_dir.name.endswith("_dagger") else ("推理" if ds_dir.name.endswith("_inference") else "其他")),
-            "episodes": int(info.get("total_episodes", 0)),
+            "episodes": ep_cnt,
             "frames": int(info.get("total_frames", 0)),
             "fps": int(info.get("fps", 30)),
             "deleted": deleted_cnt,
             "collision_avoidances": collision_cnt,
+            "verify_state": r_stat["state"],
+            "verify_warnings": r_stat["warnings"],
+            "unusable_episodes": q_stat["unusable_episodes"],
         })
     found.sort(key=lambda x: x["name"], reverse=True)
     return found
@@ -425,8 +504,327 @@ def load_lerobot_v21_details(ds_dir: str | Path) -> tuple[list[dict[str, Any]], 
     return episodes, timeline, info
 
 
+_DATASET_DATE_RE = re.compile(r"(?:^|_)(\d{4})(\d{2})(\d{2})_")
+
+
+def _extract_merged_dataset_date(ds_dir: Path, info_path: Path) -> str:
+    m = _DATASET_DATE_RE.search(ds_dir.name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    tl_path = ds_dir / "meta/session_timeline.jsonl"
+    if tl_path.is_file():
+        try:
+            for line in tl_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                ts = str(json.loads(line).get("timestamp", ""))
+                if len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
+                    return ts[:10]
+        except Exception:
+            pass
+    try:
+        return datetime.date.fromtimestamp(info_path.stat().st_mtime).isoformat()
+    except Exception:
+        return datetime.date.today().isoformat()
+
+
+def _extract_merged_collector_name(ds_dir: Path) -> str | None:
+    def _first_collector(ep_file: Path) -> str | None:
+        if not ep_file.is_file():
+            return None
+        try:
+            for line in ep_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                name = json.loads(line).get("collector_name")
+                if name:
+                    return str(name)
+        except Exception:
+            return None
+        return None
+
+    name = _first_collector(ds_dir / "meta/episodes.jsonl")
+    if name:
+        return name
+    if ds_dir.name.endswith("_merged"):
+        prefix = ds_dir.name[:-len("_merged")]
+        for suffix in ("_inference", "_dagger"):
+            name = _first_collector(ds_dir.parent / f"{prefix}{suffix}/meta/episodes.jsonl")
+            if name:
+                return name
+    return None
+
+
+def summarize_daily_merged_rounds(
+    data_root: str | Path,
+    *,
+    today: datetime.date | None = None,
+) -> dict[str, Any]:
+    """Count valid on-disk *_merged rounds grouped by date and collector."""
+    today_d = today or datetime.date.today()
+    today_str = today_d.isoformat()
+    yesterday_str = (today_d - datetime.timedelta(days=1)).isoformat()
+
+    raw_by_date: dict[str, dict[str, Any]] = {}
+    root = Path(data_root)
+    if root.is_dir():
+        for ds_dir in root.iterdir():
+            if not ds_dir.is_dir() or not ds_dir.name.endswith("_merged"):
+                continue
+            info_path = ds_dir / "meta/info.json"
+            if not info_path.is_file():
+                continue
+            try:
+                info = json.loads(info_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            episodes = int(info.get("total_episodes", 0))
+            frames = int(info.get("total_frames", 0))
+            if episodes <= 0 or frames <= 0:
+                continue
+            day = _extract_merged_dataset_date(ds_dir, info_path)
+            entry = raw_by_date.setdefault(
+                day,
+                {
+                    "rounds": 0,
+                    "usable_rounds": 0,
+                    "unusable_rounds": 0,
+                    "verified_rounds": 0,
+                    "frames": 0,
+                    "by_collector": {},
+                },
+            )
+            q_stat = summarize_dataset_quality(ds_dir, total_episodes=episodes)
+            r_stat = dataset_receipt_status(ds_dir, total_episodes=episodes)
+            is_unusable = bool(q_stat["all_unusable"])
+            entry["rounds"] += 1
+            if is_unusable:
+                entry["unusable_rounds"] += 1
+            else:
+                entry["usable_rounds"] += 1
+            if r_stat["state"] == "verified":
+                entry["verified_rounds"] += 1
+            entry["frames"] += frames
+            cname = _extract_merged_collector_name(ds_dir)
+            if cname:
+                entry["by_collector"][cname] = entry["by_collector"].get(cname, 0) + 1
+
+    by_date = dict(sorted(raw_by_date.items(), key=lambda kv: kv[0], reverse=True))
+    empty_day = {
+        "rounds": 0,
+        "usable_rounds": 0,
+        "unusable_rounds": 0,
+        "verified_rounds": 0,
+        "frames": 0,
+        "by_collector": {},
+    }
+    today_entry = by_date.get(today_str, empty_day)
+    yesterday_entry = by_date.get(yesterday_str, empty_day)
+    return {
+        "today": today_str,
+        "yesterday": yesterday_str,
+        "today_rounds": int(today_entry["rounds"]),
+        "today_usable_rounds": int(today_entry["usable_rounds"]),
+        "today_unusable_rounds": int(today_entry["unusable_rounds"]),
+        "today_verified_rounds": int(today_entry["verified_rounds"]),
+        "today_frames": int(today_entry["frames"]),
+        "today_by_collector": dict(today_entry["by_collector"]),
+        "yesterday_rounds": int(yesterday_entry["rounds"]),
+        "yesterday_usable_rounds": int(yesterday_entry["usable_rounds"]),
+        "yesterday_unusable_rounds": int(yesterday_entry["unusable_rounds"]),
+        "yesterday_verified_rounds": int(yesterday_entry["verified_rounds"]),
+        "yesterday_frames": int(yesterday_entry["frames"]),
+        "total_rounds": sum(int(v["rounds"]) for v in by_date.values()),
+        "by_date": by_date,
+    }
+
+
+def format_today_rounds_metric(summary: dict[str, Any], collector_name: str | None = None) -> str:
+    today_n = int(summary.get("today_rounds", 0))
+    usable_n = int(summary.get("today_usable_rounds", today_n))
+    unusable_n = int(summary.get("today_unusable_rounds", 0))
+    extras: list[str] = []
+    if unusable_n > 0:
+        extras.append(f"可用 {usable_n}")
+    if collector_name:
+        c_n = int((summary.get("today_by_collector") or {}).get(collector_name, 0))
+        extras.append(f"{collector_name} {c_n}")
+    if extras:
+        return f"{today_n} 轮（{' · '.join(extras)}）"
+    return f"{today_n} 轮"
+
+
+def format_daily_summary_banner(summary: dict[str, Any], *, max_extra_days: int = 4) -> str:
+    today_str = summary["today"]
+    yesterday_str = summary["yesterday"]
+    today_n = int(summary.get("today_rounds", 0))
+    today_unusable = int(summary.get("today_unusable_rounds", 0))
+    today_verified = int(summary.get("today_verified_rounds", 0))
+    yesterday_n = int(summary.get("yesterday_rounds", 0))
+    yesterday_unusable = int(summary.get("yesterday_unusable_rounds", 0))
+    yesterday_verified = int(summary.get("yesterday_verified_rounds", 0))
+
+    today_details: list[str] = []
+    if today_unusable > 0:
+        today_details.append(f"可用 {today_n - today_unusable}/不可用 {today_unusable}")
+    if today_n > 0:
+        today_details.append(f"已验 {today_verified}")
+    by_collector = summary.get("today_by_collector") or {}
+    if by_collector:
+        c_parts = "、".join(
+            f"{k} {v}" for k, v in sorted(by_collector.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        today_details.append(c_parts)
+    today_seg = f"今日 {today_str}：{today_n} 轮" + (f"（{' · '.join(today_details)}）" if today_details else "")
+
+    yest_details: list[str] = []
+    if yesterday_unusable > 0:
+        yest_details.append(f"不可用 {yesterday_unusable}")
+    if yesterday_verified > 0:
+        yest_details.append(f"已验 {yesterday_verified}")
+    yest_seg = f"昨日 {yesterday_str}：{yesterday_n} 轮" + (f"（{' · '.join(yest_details)}）" if yest_details else "")
+
+    parts = [today_seg, yest_seg]
+    extra_days = [
+        (d, v) for d, v in (summary.get("by_date") or {}).items()
+        if d not in (today_str, yesterday_str)
+    ]
+    for d, v in extra_days[:max_extra_days]:
+        parts.append(f"{d}：{int(v['rounds'])} 轮")
+    if len(extra_days) > max_extra_days:
+        parts.append(f"共 {int(summary.get('total_rounds', 0))} 轮")
+    return "每日已采汇总（*_merged）：" + "  |  ".join(parts)
+
+
+class EpisodeTagsPanel(QtWidgets.QGroupBox):
+    """Episode review form mirroring piper_ms_teleop/episode_tags_view.py (sidecar-only, never alters raw data)."""
+
+    changed = QtCore.pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__("Episode 质检标签（独立保存至 episode_tags.json，不修改原始数据）", parent)
+        self.setStyleSheet(
+            "QGroupBox { background: #131c28; border: 1px solid #223044; border-radius: 8px; "
+            "margin-top: 8px; padding: 10px 10px 8px 10px; font-weight: 600; color: #b7c8da; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; }"
+        )
+        self.root: Path | None = None
+        self.index: int | None = None
+        self.revision: int = 0
+
+        layout = QtWidgets.QGridLayout(self)
+        layout.setSpacing(6)
+
+        self.quality = QtWidgets.QComboBox()
+        for code, name in QUALITY.items():
+            self.quality.addItem(name, code)
+
+        self.presets = QtWidgets.QComboBox()
+        self.presets.addItem("添加常用标签…")
+        self.presets.addItems(PRESETS)
+        self.presets.activated.connect(self.add_preset)
+
+        self.tags = QtWidgets.QLineEdit()
+        self.tags.setPlaceholderText("标签用逗号分隔，可填写自定义标签")
+
+        self.actor = QtWidgets.QLineEdit(getpass.getuser())
+        self.actor.setMaxLength(128)
+        self.actor.setPlaceholderText("标记人")
+        self.actor.setMaximumWidth(120)
+        self.actor.setToolTip("填写实际执行本次标记的人，独立于录制采集员")
+
+        self.save_btn = QtWidgets.QPushButton("保存标签")
+        self.save_btn.clicked.connect(self.store)
+
+        self.refresh_btn = QtWidgets.QPushButton("刷新标签")
+        self.refresh_btn.clicked.connect(self.reload)
+
+        self.note = QtWidgets.QLineEdit()
+        self.note.setMaxLength(2000)
+        self.note.setPlaceholderText("问题说明或复查结果（选填）")
+
+        self.message = QtWidgets.QLabel("选择已保存的 episode 后可标记。默认可用，不会自动删除原始数据。")
+        self.message.setWordWrap(True)
+        self.message.setTextFormat(QtCore.Qt.PlainText)
+        self.message.setStyleSheet("color: #8ea5bc; font-size: 12px; font-weight: 400;")
+
+        for col, w in enumerate((self.quality, self.presets, self.tags, self.actor, self.save_btn, self.refresh_btn)):
+            layout.addWidget(w, 0, col)
+        layout.setColumnStretch(2, 2)
+        layout.addWidget(self.note, 1, 0, 1, 6)
+        layout.addWidget(self.message, 2, 0, 1, 6)
+        self.bind(None, None)
+
+    def set_default_actor(self, name: str | None) -> None:
+        if name:
+            self.actor.setText(str(name))
+
+    def bind(self, root: Path | None, index: int | None) -> None:
+        self.root = Path(root) if root is not None else None
+        self.index = int(index) if index is not None else None
+        self.setEnabled(self.root is not None and self.index is not None)
+        self.reload()
+
+    def reload(self) -> None:
+        self.revision = 0
+        self.tags.clear()
+        self.note.clear()
+        self.quality.setCurrentIndex(0)
+        self.save_btn.setEnabled(self.root is not None and self.index is not None)
+        if self.root is None or self.index is None:
+            return
+        try:
+            row = read_tags(self.root)["episodes"].get(str(self.index))
+            if row:
+                self.revision = int(row["revision"])
+                qidx = self.quality.findData(row["quality"])
+                if qidx >= 0:
+                    self.quality.setCurrentIndex(qidx)
+                self.tags.setText("，".join(row["tags"]))
+                self.note.setText(row.get("note", ""))
+                self.message.setText(
+                    f"最近标记：{row['actor']} · {row['updated_at']}（v{self.revision}）；原始数据保持不变。"
+                )
+            else:
+                self.message.setText("默认可用；可标记为「不可用」，标签和备注为选填，不会删除原始数据。")
+            if (self.root / "delivery_snapshot.json").exists():
+                self.save_btn.setEnabled(False)
+                self.message.setText("此处为不可变上传快照，标签只读；请在原采集目录上标记。")
+        except Exception as exc:
+            self.message.setText(f"读取标签失败：{exc}")
+            self.save_btn.setEnabled(False)
+
+    def add_preset(self, index: int) -> None:
+        if index > 0:
+            cur = self.tags.text().replace("，", ",").split(",")
+            merged = list(dict.fromkeys([t.strip() for t in cur if t.strip()] + [self.presets.itemText(index)]))
+            self.tags.setText("，".join(merged))
+            self.presets.setCurrentIndex(0)
+
+    def store(self) -> None:
+        if self.root is None or self.index is None:
+            return
+        try:
+            row = save_tags(
+                self.root,
+                self.index,
+                quality=self.quality.currentData(),
+                tags=self.tags.text().replace("，", ",").split(","),
+                note=self.note.text(),
+                actor=self.actor.text(),
+                expected_revision=self.revision,
+            )
+            self.reload()
+            self.changed.emit(row)
+            self.message.setText("标签已保存至 episode_tags.json；原始数据与采集员归属未修改。")
+        except Exception as exc:
+            self.message.setText(f"保存标签失败：{exc}")
+
+
 class LeRobotV21HistoryTab(QtWidgets.QWidget):
-    """Read-only LeRobot v2.1 dataset browser, deleted-gap inspector, and 3-cam MP4 player."""
+    """LeRobot v2.1 dataset browser, read-back verifier, quality tagger, and 3-cam MP4 player."""
+
+    tags_changed = QtCore.pyqtSignal()
 
     def __init__(self, data_root: str | Path):
         super().__init__()
@@ -450,10 +848,21 @@ class LeRobotV21HistoryTab(QtWidgets.QWidget):
         top.addWidget(_make_label("LeRobot v2.1 历史数据与缺口回看", "heading"))
         top.addWidget(_make_label(f"目录：{self.data_root}", "muted"))
         top.addStretch()
+        self.btn_verify_current = QtWidgets.QPushButton("读回校验当前数据集")
+        self.btn_verify_current.clicked.connect(self._verify_current_dataset)
+        top.addWidget(self.btn_verify_current)
         self.btn_refresh = QtWidgets.QPushButton("刷新列表")
         self.btn_refresh.clicked.connect(self.refresh)
         top.addWidget(self.btn_refresh)
         root.addLayout(top)
+
+        self.daily_summary_label = QtWidgets.QLabel("每日已采汇总（*_merged）：统计中…")
+        self.daily_summary_label.setWordWrap(True)
+        self.daily_summary_label.setStyleSheet(
+            "background: #142231; border: 1px solid #27405a; border-radius: 7px; "
+            "color: #cfe4f7; padding: 7px 12px; font-size: 13px; font-weight: 600;"
+        )
+        root.addWidget(self.daily_summary_label)
 
         split = QtWidgets.QHBoxLayout()
         split.setSpacing(12)
@@ -474,18 +883,18 @@ class LeRobotV21HistoryTab(QtWidgets.QWidget):
 
         # Right column: episode table + 3-cam video player
         right = QtWidgets.QVBoxLayout()
-        self.ep_table = QtWidgets.QTableWidget(0, 7)
+        self.ep_table = QtWidgets.QTableWidget(0, 9)
         self.ep_table.setHorizontalHeaderLabels([
-            "episode_index", "帧数", "attempt_index", "前面被删缺口", "紧跟推理段", "采集员", "防碰撞微调",
+            "episode_index", "帧数", "读回校验", "质检标签", "attempt_index", "前面被删缺口", "紧跟推理段", "采集员", "防碰撞微调",
         ])
         hdr = self.ep_table.horizontalHeader()
-        hdr.setMinimumSectionSize(76)
-        for col_idx in range(6):
+        hdr.setMinimumSectionSize(72)
+        for col_idx in range(8):
             hdr.setSectionResizeMode(col_idx, QtWidgets.QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(8, QtWidgets.QHeaderView.Stretch)
         self.ep_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.ep_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.ep_table.setMaximumHeight(200)
+        self.ep_table.setMaximumHeight(185)
         self.ep_table.currentCellChanged.connect(lambda r, *_: self._select_episode(r))
         right.addWidget(self.ep_table)
 
@@ -515,33 +924,123 @@ class LeRobotV21HistoryTab(QtWidgets.QWidget):
         ctrl.addWidget(self.frame_label)
         right.addLayout(ctrl)
 
+        self.tags_panel = EpisodeTagsPanel()
+        self.tags_panel.changed.connect(self._on_tags_saved)
+        right.addWidget(self.tags_panel)
+
         split.addLayout(right, 2)
         root.addLayout(split, 1)
+        self._refresh_daily_summary()
+
+    def _refresh_daily_summary(self) -> dict[str, Any]:
+        summary = summarize_daily_merged_rounds(self.data_root)
+        self.daily_summary_label.setText(format_daily_summary_banner(summary))
+        return summary
 
     def refresh(self) -> None:
         self._close_caps()
+        self._refresh_daily_summary()
         self._datasets = scan_lerobot_v21_datasets(self.data_root)
         self.ds_list.clear()
         for item in self._datasets:
-            gap = f"  ⚠ 缺口:{item['deleted']}" if item["deleted"] else ""
-            col = f"  🛡 防碰:{item['collision_avoidances']}" if item.get("collision_avoidances") else ""
-            self.ds_list.addItem(f"[{item['kind']}] {item['name']}  ({item['episodes']}段/{item['frames']}帧{gap}{col})")
+            self.ds_list.addItem(self._format_ds_list_item(item))
         if self._datasets:
             self.ds_list.setCurrentRow(0)
         else:
+            self._current_ds = None
             self.ep_table.setRowCount(0)
+            self.tags_panel.bind(None, None)
             self.timeline_box.setPlainText("暂无 LeRobot v2.1 数据集。")
 
-    def _select_dataset(self, row: int) -> None:
+    @staticmethod
+    def _format_ds_list_item(item: dict[str, Any]) -> str:
+        vstate = item.get("verify_state", "unverified")
+        vbadge = {"verified": "✅", "partial": "🟡", "failed": "❌"}.get(vstate, "○")
+        gap = f"  ⚠ 缺口:{item['deleted']}" if item.get("deleted") else ""
+        col = f"  🛡 防碰:{item['collision_avoidances']}" if item.get("collision_avoidances") else ""
+        unusable = f"  🚫不可用:{item['unusable_episodes']}" if item.get("unusable_episodes") else ""
+        return f"{vbadge} [{item['kind']}] {item['name']}  ({item['episodes']}段/{item['frames']}帧{gap}{col}{unusable})"
+
+    def _on_tags_saved(self, _row: object = None) -> None:
+        cur_ds_row = self.ds_list.currentRow()
+        cur_ep_row = self.ep_table.currentRow()
+        self._refresh_daily_summary()
+        if 0 <= cur_ds_row < len(self._datasets):
+            ds_item = self._datasets[cur_ds_row]
+            q_stat = summarize_dataset_quality(ds_item["path"], total_episodes=ds_item["episodes"])
+            ds_item["unusable_episodes"] = q_stat["unusable_episodes"]
+            list_item = self.ds_list.item(cur_ds_row)
+            if list_item is not None:
+                list_item.setText(self._format_ds_list_item(ds_item))
+            self._select_dataset(cur_ds_row, keep_ep_row=cur_ep_row)
+        self.tags_changed.emit()
+
+    def _verify_current_dataset(self) -> None:
+        cur_ds_row = self.ds_list.currentRow()
+        if self._current_ds is None or cur_ds_row < 0 or cur_ds_row >= len(self._datasets):
+            return
+        cur_ep_row = self.ep_table.currentRow()
+        try:
+            rep = verify_dataset_v21(self._current_ds, write_receipts=True)
+            if rep["passed"]:
+                wtxt = f"（提示：{'; '.join(rep['warnings'])}）" if rep.get("warnings") else ""
+                msg = f"✅ 读回校验通过：{rep['episodes']} 段 / {rep['frames']} 帧，已写入 save_receipts 回执{wtxt}"
+            else:
+                msg = f"❌ 读回校验发现异常：{'; '.join(rep.get('errors') or [])}"
+        except Exception as exc:
+            msg = f"❌ 读回校验失败：{exc}"
+        ds_item = self._datasets[cur_ds_row]
+        r_stat = dataset_receipt_status(ds_item["path"], total_episodes=ds_item["episodes"])
+        ds_item["verify_state"] = r_stat["state"]
+        ds_item["verify_warnings"] = r_stat["warnings"]
+        list_item = self.ds_list.item(cur_ds_row)
+        if list_item is not None:
+            list_item.setText(self._format_ds_list_item(ds_item))
+        self._refresh_daily_summary()
+        self._select_dataset(cur_ds_row, keep_ep_row=cur_ep_row)
+        self.tags_panel.message.setText(msg)
+        self.tags_changed.emit()
+
+    def _select_dataset(self, row: int, *, keep_ep_row: int = 0) -> None:
         self._close_caps()
         if row < 0 or row >= len(self._datasets):
+            self._current_ds = None
+            self.tags_panel.bind(None, None)
             return
         ds_path = Path(self._datasets[row]["path"])
         self._current_ds = ds_path
         episodes, timeline, _info = load_lerobot_v21_details(ds_path)
+        receipts = read_save_receipts(ds_path)
+        try:
+            tag_episodes = read_tags(ds_path).get("episodes") or {}
+        except Exception:
+            tag_episodes = {}
         self._current_episodes = episodes
         self.ep_table.setRowCount(len(episodes))
         for r, ep in enumerate(episodes):
+            ep_idx = int(ep["episode_index"])
+            rec = receipts.get(ep_idx)
+            if rec is None:
+                verify_str = "未校验"
+                verify_color = "#8ea5bc"
+            elif rec.get("passed") is True:
+                warns = rec.get("warnings") or []
+                verify_str = f"✅ 提示({len(warns)})" if warns else "✅ 通过"
+                verify_color = "#f5b864" if warns else "#58d68d"
+            else:
+                verify_str = "❌ 失败"
+                verify_color = "#f07178"
+
+            trow = tag_episodes.get(str(ep_idx))
+            if trow:
+                q_label = QUALITY.get(trow.get("quality", "usable"), "可用")
+                t_list = trow.get("tags") or []
+                tag_str = f"{q_label} · {'、'.join(t_list)}" if t_list else q_label
+                tag_color = "#f07178" if trow.get("quality") == "unusable" else "#7ad8ff"
+            else:
+                tag_str = "可用"
+                tag_color = "#a7bdd4"
+
             deleted_before = ep.get("deleted_attempts_before") or []
             gap_str = ", ".join(f"attempt#{x}" for x in deleted_before) if deleted_before else "无"
             after_inf = ep.get("after_inference_episode")
@@ -554,19 +1053,25 @@ class LeRobotV21HistoryTab(QtWidgets.QWidget):
             else:
                 ca_str = "无"
             vals = [
-                f"episode_{int(ep['episode_index']):06d}",
+                f"episode_{ep_idx:06d}",
                 str(ep.get("length", 0)),
-                str(ep.get("attempt_index", ep["episode_index"])),
+                verify_str,
+                tag_str,
+                str(ep.get("attempt_index", ep_idx)),
                 gap_str,
                 f"inf#{after_inf:06d}" if after_inf is not None else "—",
                 str(ep.get("collector_name") or "—"),
                 ca_str,
             ]
-            for c, txt in enumerate(vals):
-                item = QtWidgets.QTableWidgetItem(txt)
-                if c == 3 and deleted_before:
+            for c, val_txt in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(val_txt)
+                if c == 2:
+                    item.setForeground(QtGui.QColor(verify_color))
+                elif c == 3:
+                    item.setForeground(QtGui.QColor(tag_color))
+                elif c == 5 and deleted_before:
                     item.setForeground(QtGui.QColor("#f5b864"))
-                elif c == 6 and ca_str != "无":
+                elif c == 8 and ca_str != "无":
                     item.setForeground(QtGui.QColor("#7ad8ff"))
                 self.ep_table.setItem(r, c, item)
 
@@ -595,8 +1100,11 @@ class LeRobotV21HistoryTab(QtWidgets.QWidget):
                 )
         self.timeline_box.setPlainText("\n".join(lines) if lines else "无时间线事件记录。")
         if episodes:
-            self.ep_table.selectRow(0)
-            self._select_episode(0)
+            target_row = keep_ep_row if 0 <= keep_ep_row < len(episodes) else 0
+            self.ep_table.selectRow(target_row)
+            self._select_episode(target_row)
+        else:
+            self.tags_panel.bind(None, None)
 
     def _close_caps(self) -> None:
         self._play_timer.stop()
@@ -615,9 +1123,11 @@ class LeRobotV21HistoryTab(QtWidgets.QWidget):
     def _select_episode(self, row: int) -> None:
         self._close_caps()
         if self._current_ds is None or row < 0 or row >= len(self._current_episodes):
+            self.tags_panel.bind(None, None)
             return
         ep = self._current_episodes[row]
         ep_idx = int(ep["episode_index"])
+        self.tags_panel.bind(self._current_ds, ep_idx)
         chunk_idx = ep_idx // 1000
         counts = []
         for cam_key, lr_key in LEROBOT_CAMERA_KEYS.items():
@@ -729,6 +1239,9 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.live_page, "实时 DAgger 工作台")
 
         self.history_tab = LeRobotV21HistoryTab(self.dataset_dir)
+        self.history_tab.tags_changed.connect(self._refresh_daily_stats)
+        if collector_name:
+            self.history_tab.tags_panel.set_default_actor(collector_name)
         self.tabs.addTab(self.history_tab, "历史数据与缺口 (v2.1)")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -746,6 +1259,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         else:
             self.pedal_badge.setText("● 未启用踏板（键盘/按钮模式）")
 
+        self._refresh_daily_stats()
         self._refresh_ui()
         if auto_start:
             QtCore.QTimer.singleShot(50, self.start_new_round)
@@ -817,6 +1331,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         metrics_row.setSpacing(10)
         self.metrics: dict[str, QtWidgets.QLabel] = {}
         for key, title, default in (
+            ("daily", "今日已采轮数", "0 轮"),
             ("inference", "推理已存 (段/帧)", "0 段 / 0 帧"),
             ("dagger", "DAgger 已存 (段/帧/缺口)", "0 段 / 0 帧"),
             ("current", "当前段帧数 / 步数", "0 帧"),
@@ -941,16 +1456,27 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         if snap["ready"] and token in ("left", "save", "resume", "delete"):
             self.active_app.handle_operator_action(token, source="pedal")
 
+    def _refresh_daily_stats(self) -> dict[str, Any]:
+        summary = summarize_daily_merged_rounds(self.dataset_dir)
+        collector = self.collector_combo.currentData() if hasattr(self, "collector_combo") else None
+        if "daily" in self.metrics:
+            self.metrics["daily"].setText(format_today_rounds_metric(summary, collector))
+        return summary
+
     def _on_collector_changed(self) -> None:
         name = self.collector_combo.currentData()
         if self.active_app is not None:
             self.active_app.set_collector_name(name)
+        if hasattr(self, "history_tab") and name:
+            self.history_tab.tags_panel.set_default_actor(name)
+        self._refresh_daily_stats()
 
     def _on_tab_changed(self, idx: int) -> None:
         if idx == 1:
             self.history_tab.refresh()
         else:
             self.history_tab.pause()
+            self._refresh_daily_stats()
 
     def _append_standby_log(self, msg: str, level: str = "info") -> None:
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1037,6 +1563,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         for c in self.cam_cards.values():
             c.clear_frame()
         self.arm_bar.update_from_sample(None, mode_label="待机", age_s=None)
+        self._refresh_daily_stats()
         self._refresh_ui()
 
     def _refresh_ui(self) -> None:
@@ -1101,16 +1628,73 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         else:
             badge_txt, fg, bg = f"● {mode}", "#cfe0f2", "#1f2d3e"
 
+        obs_error = snap.get("obs_error")
+        age_s_check = snap.get("sample_age_s")
+        cam_health = snap.get("camera_health") or {}
+        faulty_cams = list(snap.get("faulty_cameras") or [])
+        cam_fault = ready and not stopping and (
+            bool(faulty_cams) or bool(snap.get("obs_stale")) or bool(obs_error) or (age_s_check is not None and age_s_check > 2.0)
+        )
+        faulty_names = []
+        faulty_names_detail = []
+        for ck in faulty_cams:
+            info_c = cam_health.get(ck) or {}
+            lbl = info_c.get("label") or ck
+            ser = info_c.get("serial") or ""
+            c_age = info_c.get("age_s")
+            faulty_names.append(lbl)
+            age_part = f"停更 {c_age:.1f}s" if c_age is not None else "中断"
+            ser_part = f" {ser}" if ser else ""
+            faulty_names_detail.append(f"{lbl}({ser_part.strip()} {age_part})".replace("( ", "("))
+
+        if cam_fault:
+            if faulty_names:
+                badge_txt = f"❌ {'/'.join(faulty_names)}中断"
+            else:
+                stall_txt = f"{age_s_check:.1f}s" if age_s_check is not None else "异常"
+                badge_txt = f"❌ 相机中断（停帧 {stall_txt}）"
+            fg, bg = "#ffffff", "#b81d2c"
+
         self.status_badge.setText(badge_txt)
         self.status_badge.setStyleSheet(
             f"background: {bg}; color: {fg}; border-radius: 7px; padding: 8px 14px; font-weight: 700;"
         )
-        self.guide_banner.setText(snap["status_message"])
-        border_col = "#d65a66" if mode == "CONFIRM_SAVE" else ("#c79a44" if in_handoff or mode == "TRANSITION_TO_DAGGER" else "#2a435e")
-        self.guide_banner.setStyleSheet(
-            f"background: #152334; border: 1px solid {border_col}; border-radius: 8px; "
-            "color: #eef6ff; padding: 9px 14px; font-size: 14px; font-weight: 600;"
-        )
+
+        if cam_fault:
+            if faulty_names_detail:
+                who = f"【{'、'.join(faulty_names_detail)}】"
+            else:
+                stall_desc = f"已停更 {age_s_check:.1f} 秒" if age_s_check is not None else "采帧失败"
+                who = f"相机画面（{stall_desc}）"
+            err_tail = f"（{obs_error}）" if obs_error else ""
+            self.guide_banner.setText(
+                f"🚨 警告：{who}异常，当前已停止录帧，右单踩无法保存！请检查该相机 USB 线后踩「右双踩」结束本轮并重开{err_tail}"
+            )
+            self.guide_banner.setStyleSheet(
+                "background: #5c131c; border: 2px solid #ff4d5a; border-radius: 8px; "
+                "color: #ffffff; padding: 10px 14px; font-size: 15px; font-weight: 700;"
+            )
+        else:
+            msg_txt = str(snap["status_message"])
+            self.guide_banner.setText(msg_txt)
+            is_err_msg = msg_txt.startswith("❌")
+            is_warn_msg = msg_txt.startswith("⚠️")
+            if is_err_msg:
+                self.guide_banner.setStyleSheet(
+                    "background: #4a161e; border: 2px solid #ff4d5a; border-radius: 8px; "
+                    "color: #ffe4e7; padding: 10px 14px; font-size: 14px; font-weight: 700;"
+                )
+            elif is_warn_msg or mode == "CONFIRM_SAVE":
+                self.guide_banner.setStyleSheet(
+                    "background: #3d2416; border: 2px solid #f08a4b; border-radius: 8px; "
+                    "color: #fff2e0; padding: 10px 14px; font-size: 14px; font-weight: 700;"
+                )
+            else:
+                border_col = "#c79a44" if in_handoff or mode == "TRANSITION_TO_DAGGER" else "#2a435e"
+                self.guide_banner.setStyleSheet(
+                    f"background: #152334; border: 1px solid {border_col}; border-radius: 8px; "
+                    "color: #eef6ff; padding: 9px 14px; font-size: 14px; font-weight: 600;"
+                )
 
         # Metrics
         self.metrics["inference"].setText(f"{snap['inference_episodes']} 段 / {snap['inference_saved_frames']} 帧")
@@ -1149,7 +1733,14 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
             for cam_key in CAMERA_NAMES:
                 bgr = sample.images_bgr.get(cam_key)
                 if bgr is not None:
-                    self.cam_cards[cam_key].set_bgr(bgr, age_s=age_s)
+                    ch = cam_health.get(cam_key) if isinstance(cam_health, dict) else None
+                    if ch is not None and ch.get("age_s") is not None:
+                        c_age = ch["age_s"]
+                        c_err = obs_error if ch.get("stale") else None
+                    else:
+                        c_age = age_s
+                        c_err = obs_error
+                    self.cam_cards[cam_key].set_bgr(bgr, age_s=c_age, obs_error=c_err)
         arm_mode_lbl = (
             "主臂直通转发" if mode == "DAGGER_RECORDING"
             else ("跟随暂停" if mode in ("DAGGER_PAUSED", "CONFIRM_SAVE")

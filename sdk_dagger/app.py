@@ -142,6 +142,10 @@ class SDKDaggerApp:
 
         self._latest_sample: FrameSample | None = None
         self._latest_sample_lock = threading.Lock()
+        self._obs_error: str | None = None
+        self._obs_error_since: float | None = None
+        self._obs_error_last_emit: float = 0.0
+        self._obs_error_announced: bool = False
         self._inference_samples: list[FrameSample] = []
         self._dagger_samples: list[FrameSample] = []
         self._preroll_ring: deque[FrameSample] = deque(maxlen=120)
@@ -227,7 +231,16 @@ class SDKDaggerApp:
             "dagger_deleted_attempts": dag_deleted,
             "pending_video_jobs": pending_vid,
             "sample": sample,
-            "sample_age_s": max(0.0, time.time() - sample.timestamp) if sample is not None else None,
+            "sample_age_s": (sample_age := (max(0.0, time.time() - sample.timestamp) if sample is not None else None)),
+            "camera_health": (cam_health := (self.rig.get_camera_health() if hasattr(self.rig, "get_camera_health") else {})),
+            "faulty_cameras": [k for k, v in cam_health.items() if v.get("stale")],
+            "obs_error": self._obs_error,
+            "obs_error_s": (max(0.0, now - self._obs_error_since) if self._obs_error_since is not None else 0.0),
+            "obs_stale": bool(
+                any(v.get("stale") for v in cam_health.values())
+                or (sample_age is not None and sample_age > 2.0)
+                or (self._obs_error is not None)
+            ),
             "inference_dir": str(self.inference_dir),
             "dagger_dir": str(self.dagger_dir),
             "recent_events": recent_events,
@@ -393,9 +406,38 @@ class SDKDaggerApp:
                 sample = self.rig.read_sample()
             except Exception as exc:
                 if not self._stop_event.is_set():
-                    print(f"⚠️ 观测采集暂时异常：{exc}", flush=True)
-                time.sleep(0.005)
+                    now_m = time.monotonic()
+                    err_s = str(exc)
+                    print(f"⚠️ 观测采集暂时异常：{err_s}", flush=True)
+                    with self._lock:
+                        if self._obs_error_since is None:
+                            self._obs_error_since = now_m
+                        self._obs_error = err_s
+                        should_emit = (now_m - self._obs_error_last_emit) >= 8.0
+                        if should_emit:
+                            self._obs_error_last_emit = now_m
+                        should_announce = not self._obs_error_announced
+                        if should_announce:
+                            self._obs_error_announced = True
+                    if should_emit:
+                        self._emit_event(
+                            f"❌ 相机/观测采帧异常（当前已停止录帧，请检查相机 USB 线）：{err_s}",
+                            level="error",
+                        )
+                    if should_announce:
+                        self.voice.announce("camera_error")
+                time.sleep(0.05)
                 continue
+
+            recovered = False
+            with self._lock:
+                if self._obs_error is not None or self._obs_error_since is not None:
+                    self._obs_error = None
+                    self._obs_error_since = None
+                    self._obs_error_announced = False
+                    recovered = True
+            if recovered:
+                self._emit_event("✅ 相机/观测采帧已恢复正常")
 
             with self._latest_sample_lock:
                 self._latest_sample = sample
@@ -494,7 +536,18 @@ class SDKDaggerApp:
             samples = list(self._dagger_samples)
             self._dagger_samples.clear()
         if len(samples) < 2:
-            print("\033[31m当前没有可保存的纠正数据。\033[0m", flush=True)
+            with self._latest_sample_lock:
+                ls = self._latest_sample
+            ls_age = (time.time() - ls.timestamp) if ls is not None else None
+            obs_err = self._obs_error
+            if obs_err or (ls_age is not None and ls_age > 2.0):
+                reason = f"相机已停帧 {ls_age:.1f}s" if (ls_age is not None and ls_age > 2.0) else f"相机异常：{obs_err}"
+                msg = f"❌ 本段仅录到 {len(samples)} 帧，未保存（{reason}）！不会进入 10 秒删除确认，请检查相机 USB 线并结束本轮重开。"
+                self.voice.announce("camera_error")
+            else:
+                msg = f"⚠️ 本段仅录到 {len(samples)} 帧（不足 2 帧），未保存，未触发 10 秒删除确认。"
+            print(f"\033[31m{msg}\033[0m", flush=True)
+            self._emit_event(msg, level="error")
             return {"saved": False, "frames": 0}
 
         if self.dagger_writer is not None:
@@ -850,8 +903,9 @@ class SDKDaggerApp:
                         collector_name=self.collector_name,
                     )
                     if mres.get("merged"):
+                        vtag = "（✅ 读回校验通过）" if mres.get("verified") else "（⚠️ 校验有异常，请查看历史页）"
                         self._emit_event(
-                            f"已自动拼接本轮连续 LeRobot 片段：{mres['episodes']} 段 / {mres['frames']} 帧 -> {self.merged_dir.name}"
+                            f"已自动拼接本轮连续 LeRobot 片段：{mres['episodes']} 段 / {mres['frames']} 帧{vtag} -> {self.merged_dir.name}"
                         )
                 except Exception as exc:
                     print(f"\033[31m[自动拼接] 拼接连续片段失败（原始 inference/dagger 数据完整不受影响）：{exc}\033[0m", flush=True)

@@ -43,11 +43,11 @@ camera:
     model_key: top_head
     record_key: cam_high
   right:
-    serial: "263022070473"
+    serial: "263022071527"
     model_key: hand_right
     record_key: cam_right_wrist
   left:
-    serial: "263022071527"
+    serial: "263022070473"
     model_key: hand_left
     record_key: cam_left_wrist
 

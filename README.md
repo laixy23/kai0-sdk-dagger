@@ -1,69 +1,94 @@
-# Kai0 纯 SDK DAgger（零 ROS）
+# Kai0 SDK DAgger for AgileX PiPER
 
-本目录为 `precision-5090` 上的**零 ROS 纯 SDK 版 DAgger 采集实现**（`/home/ubuntu/dev/kai0-sdk-dagger`），参考 `/home/ubuntu/dev/inference-origin` 的纯 SDK 架构，完全不依赖 `roscore`、`realsense2_camera` 或 Piper ROS 节点。
+A ROS-free DAgger collector for recording policy rollouts and human corrections on bimanual AgileX PiPER arms.
 
-## 与 ROS 版（`kai0-official-dagger`）对比
+在双臂策略执行过程中，如果机械臂漏抓或跑偏，操作者可以随时暂停策略，用两只主臂拖动从臂完成人工纠正，再把控制权交回模型，同一轮内支持多次接管。
 
-| 模块 | 原 ROS 版（`kai0-official-dagger`） | 本目录纯 SDK 版（`kai0-sdk-dagger`） |
+这一版去掉了 `roscore`、`realsense2_camera` 和 Piper ROS 节点依赖，直接通过 `piper_sdk`、`pyrealsense2` 和原生 SocketCAN 控制四只机械臂与三台 RealSense 相机，并默认导出兼容 Kai0 / LeRobot v2.1 的数据集。键盘、USB 双踏板和 PyQt5 桌面界面共用同一套状态机。
+
+## 离线查看与模拟运行
+
+没有连接机械臂和相机时，可以先查看各入口帮助，或用 `--mock` 跑通完整状态机和单元测试：
+
+```bash
+git clone https://github.com/laixy23/kai0-sdk-dagger.git
+cd kai0-sdk-dagger
+
+bash run_dagger_sdk.sh --help
+bash run_dagger_sdk_pedal.sh --help
+bash run_dagger_sdk_gui.sh --help
+
+# 无硬件全流程模拟
+bash run_dagger_sdk.sh --mock
+
+# 离线单元测试
+python3 -m unittest discover -s tests -v
+```
+
+## 实机启动
+
+实机配置见 [config/dagger_precision_5090.yaml](config/dagger_precision_5090.yaml)，按自己的设备修改 CAN 适配器序列号、三台 RealSense 序列号以及策略服务地址（WebSocket）。
+
+```bash
+# 1. 只读检查 CAN、踏板、策略服务与三路相机（不动机械臂）
+bash run_dagger_sdk_pedal.sh --check-startup
+
+# 2. 启动 PyQt5 桌面工作台（三路实时画面、双臂读数、双踏板待机循环与历史回放）
+bash run_dagger_sdk_gui.sh
+
+# 3. 命令行 + USB 双踏板启动
+bash run_dagger_sdk_pedal.sh
+```
+
+> 相机由 `pyrealsense2` 直接独占打开；如果机器上此前运行过 ROS 相机服务，正式启动时会自动先停掉它（`--check-startup` 只读检查不会停止）。
+
+## 一轮采集怎么操作
+
+| 目的 | 键盘 | USB 双踏板 |
 | --- | --- | --- |
-| 相机采集 | `kai0-official-cameras.service`（ROS1 nodelet） | 直接 `pyrealsense2`（复用 `inference-origin` 的 `RealSenseRig`，独立 30 Hz 时间戳对齐采样线程） |
-| 从臂推理控制 | ROS1 `piper` 节点 30 Hz | 直接 `piper_sdk`（复用 `inference-origin` 的 `PiperDualArm`，支持 200 Hz `high_follow` 三次插值） |
-| 主臂示教接管 | ROS1 主臂节点 + 话题转发 | 进程内直接 `piper_sdk` + 原生 SocketCAN `NativeMasterReader`（零 ROS 跳数） |
-| 模型推理客户端 | 独立 WebSocket 封装 | 复用 `inference-origin` `.venv-client` + `WebsocketClientPolicy` + `StreamActionBuffer(temporal)` |
-| 数据格式 | `*_inference_hdf5` / `*_dagger_hdf5` + 三路 `.mp4` | **默认直接保存为 Kai0 兼容 LeRobot v2.1 格式**（Parquet + 三路后台异步并行 `.mp4` + `meta/`；可在配置中设 `recording.format: hdf5` 切回旧 HDF5） |
-| 双踏板与待机循环 | 左单/右单/左双/右双 + 待机左双踩开新一轮 | **完全一致（全中文命令行提示）** |
+| 暂停策略，主臂对齐后开始录制人工纠正 | `d` | 左单踩 |
+| 暂停跟随，保存当前纠正段 | `s` | 右单踩 |
+| 删除刚保存的纠正段（保存后 10 秒窗口内） | `w` | —（界面按钮或键盘 `w`） |
+| 确认保存后，继续录下一段人工纠正 | `空格` / `d` | 左单踩 |
+| 把控制权交回策略（未保存时会自动先保存） | `r` | 左双踩 |
+| 待机状态下开始新一轮 | — | 左双踩 |
+| 结束本轮（双踏板进入待机；终端退出程序） | `Ctrl+C` | 右双踩 |
 
-## 默认输出结构（LeRobot v2.1）
+接管就绪后会自动开始录制。保存后有 10 秒确认窗口，窗口内按 `w` 会撤销刚保存的这一段，按其他键或踏板则提前确认保留。
 
-每轮默认生成两个可直接被 Kai0 / LeRobot v2.1 加载的数据集目录（路径在 `/home/ubuntu/dev/kai0-sdk-dagger/data/` 下）：
-- `<dataset_name>_inference/`（模型自主推理段）
-- `<dataset_name>_dagger/`（人工纠正段，仅在有保存记录时创建）
+## 输出数据（LeRobot v2.1）
 
-目录内容：
+默认会在 `data/` 下按轮次生成以下目录（如需旧版 HDF5，可在配置中把 `recording.format` 设为 `hdf5`）：
+
+- `<dataset_name>_inference/`：策略自主执行段
+- `<dataset_name>_dagger/`：人工纠正段（仅在有保存记录时创建）
+- `<dataset_name>_merged/`：开启 `auto_merge_round` 时，本轮结束自动按时间顺序拼接的连续数据集
+
+每个 LeRobot v2.1 目录结构如下：
+
 ```text
 <dataset_name>_{inference|dagger}/
-├── data/
-│   └── chunk-000/
-│       └── episode_000000.parquet
-├── videos/
-│   └── chunk-000/
-│       ├── observation.images.top_head/episode_000000.mp4
-│       ├── observation.images.hand_left/episode_000000.mp4
-│       └── observation.images.hand_right/episode_000000.mp4
+├── data/chunk-000/episode_000000.parquet
+├── videos/chunk-000/
+│   ├── observation.images.top_head/episode_000000.mp4
+│   ├── observation.images.hand_left/episode_000000.mp4
+│   └── observation.images.hand_right/episode_000000.mp4
 └── meta/
     ├── info.json
     ├── episodes.jsonl
     ├── tasks.jsonl
     ├── episodes_stats.jsonl
-    └── session_timeline.jsonl   # 按时间顺序记录每段保存/删除事件与缺口
+    └── session_timeline.jsonl
 ```
 
-- `observation.state` / `action` 均为 `float32[14]`（`[left_j1..6, left_grip, right_j1..6, right_grip]`，且 `action[t] = qpos[t+1]`）。
-- 按 `w` 删除刚保存的纠正段时，会取消/删除对应的 `.parquet` 和三路 `.mp4`，保持 `episode_XXXXXX` 连续（兼容 Kai0 `LeRobotDataset` 直接加载），同时在 `meta/episodes.jsonl`（`attempt_index`、`deleted_attempts_before`、`after_inference_episode`）与 `meta/session_timeline.jsonl` 中完整保留缺失记录。
+- `observation.state` 与 `action` 均为 `float32[14]`（先左后右，每侧 6 关节 + 1 夹爪），训练配对满足 `action[t] = qpos[t+1]`。
+- 在确认窗口内删除纠正段时，会同步移除对应的 `.parquet` 和三路 `.mp4`，保持 `episode_XXXXXX` 编号连续以便直接加载；删除记录与缺口位置会保留在 `meta/episodes.jsonl` 和 `meta/session_timeline.jsonl` 中。
 
-> **注意：** 因为 `pyrealsense2` 需要直接访问三台 RealSense 相机，正式启动 SDK 版时会自动停止旧的 `kai0-official-cameras.service`（与 `inference-origin` 一致）。只读检查 `--check-startup` 不会停止它。
+## 目录结构
 
-## 快速使用
-
-```bash
-cd /home/ubuntu/dev
-
-# 1. 只读检查（不动机械臂、不停止 ROS 相机）
-bash kai0-sdk-dagger/run_dagger_sdk_pedal.sh --check-startup
-
-# 2. PyQt5 桌面工作台一键启动（实时三路画面 + 双臂读数 + 10秒删除倒计时 + 内置双踏板待机循环 + LeRobot v2.1 历史回放）
-bash kai0-sdk-dagger/run_dagger_sdk_gui.sh
-
-# 3. 命令行双踏板一键启动（默认开启两态待机循环：右双踩结束本轮进待机，左双踩开新一轮，终端 Ctrl+C 彻底退出）
-bash kai0-sdk-dagger/run_dagger_sdk_pedal.sh
-
-# 3. 无硬件模拟测试
-bash kai0-sdk-dagger/run_dagger_sdk.sh --mock
-```
-
-## 运行自动化测试（零硬件）
-
-```bash
-cd /home/ubuntu/dev/kai0-sdk-dagger
-/home/ubuntu/dev/inference-origin/.venv-client/bin/python -m unittest discover -s tests -v
-```
+- [sdk_dagger/](sdk_dagger/)：核心采集状态机、硬件驱动封装（`piper_sdk` / `pyrealsense2` / 200 Hz `high_follow`）、手柄防碰撞检测、LeRobot v2.1 / HDF5 存储、语音提示与 PyQt5 界面
+- [operator/](operator/)：USB 双踏板识别、校准、权限配置与待机循环进程管理
+- [setup/](setup/)：按序列号激活 CAN、示教识别、主从臂对齐与恢复脚本
+- [config/](config/) 与 [_runtime/](_runtime/)：实机 YAML 配置与踏板映射配置
+- [assets/voice/](assets/voice/)：采集状态中文语音提示音频
+- [tests/](tests/)：无硬件状态机、LeRobot 导出、踏板待机循环与 GUI 单元测试

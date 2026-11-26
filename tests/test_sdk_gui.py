@@ -28,6 +28,7 @@ def _fast_gui_cfg(tmp_dir: Path) -> dict:
     cfg["recording"]["dagger_preroll_s"] = 0.08
     cfg["recording"]["save_confirm_timeout_s"] = 2.0
     cfg["recording"]["confirm_inference_save"] = False
+    cfg["recording"]["confirm_round_save"] = False
     cfg["inference"]["publish_rate"] = 50
     cfg["inference"]["inference_rate"] = 10
     return cfg
@@ -703,6 +704,106 @@ class SDKDaggerGUITests(unittest.TestCase):
             finally:
                 win.active_app = None
                 win.close()
+
+    def test_gui_stop_round_unsaved_dagger_and_whole_round_discard_or_keep(self):
+        """Right-double stop prompts for both unsaved last segment (inference/dagger) and whole-round keep/discard."""
+        from sdk_dagger.voice import VoiceAnnouncer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = _fast_gui_cfg(tmp_path)
+            cfg["recording"]["confirm_inference_save"] = True
+            cfg["recording"]["confirm_round_save"] = True
+            cfg["recording"]["save_confirm_timeout_s"] = 3.0
+            win = SDKDaggerMainWindow(
+                cfg,
+                dataset_dir=tmp_path,
+                mock=True,
+                enable_pedal=False,
+                auto_start=False,
+                voice=VoiceAnnouncer(enabled=False),
+            )
+            try:
+                # --- Round 1: Keep inference -> enter DAgger -> stop directly while DAGGER_RECORDING ---
+                # Step 1: unsaved DAgger segment prompts confirm -> delete it
+                # Step 2: whole-round prompts confirm -> delete ENTIRE round (removes all dirs!)
+                win.btn_start_round.click()
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app is not None and win.active_app.get_ui_snapshot()["ready"]))
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.get_ui_snapshot()["current_inference_frames"] >= 5))
+                win._refresh_ui()
+                win.btn_takeover.click()
+
+                # Keep inference segment before DAgger
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.mode == "CONFIRM_SAVE"))
+                win._refresh_ui()
+                self.assertEqual(win.active_app.get_ui_snapshot()["confirm_target"], "inference")
+                win.btn_confirm.click()
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.mode == "DAGGER_RECORDING"))
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.get_ui_snapshot()["current_dagger_frames"] >= 5))
+                win._refresh_ui()
+
+                # Trigger right-double stop while actively recording DAgger (no prior 's')
+                win._on_pedal_gesture("stop")
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None
+                    and win.active_app.mode == "CONFIRM_SAVE"
+                    and win.active_app.get_ui_snapshot()["confirm_target"] == "dagger",
+                ))
+                win._refresh_ui()
+                self.assertIn("撤销删除纠正段", win.btn_delete.text())
+                win.btn_delete.click()
+
+                # Next: whole-round confirmation (because earlier inference segment is still kept)
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None
+                    and win.active_app.mode == "CONFIRM_SAVE"
+                    and win.active_app.get_ui_snapshot()["confirm_target"] == "round",
+                ))
+                win._refresh_ui()
+                self.assertIn("丢弃整轮数据", win.btn_delete.text())
+                self.assertIn("确认保留整轮", win.btn_confirm.text())
+                win.btn_delete.click()
+
+                # Round finishes cleanly and ALL directories from Round 1 are deleted
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app is None, timeout=8.0))
+                self.assertEqual(win._last_round_error, "")
+                self.assertEqual(list(tmp_path.iterdir()), [])
+
+                # --- Round 2: Stop during INFERENCE -> keep final inference -> keep whole round ---
+                win.btn_start_round.click()
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app is not None and win.active_app.get_ui_snapshot()["ready"]))
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.get_ui_snapshot()["current_inference_frames"] >= 5))
+                win._refresh_ui()
+
+                win._on_pedal_gesture("stop")
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None
+                    and win.active_app.mode == "CONFIRM_SAVE"
+                    and win.active_app.get_ui_snapshot()["confirm_target"] == "inference",
+                ))
+                win._refresh_ui()
+                # Right-double again during CONFIRM_SAVE confirms keeping (never force-kills!)
+                win._on_pedal_gesture("stop")
+
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None
+                    and win.active_app.mode == "CONFIRM_SAVE"
+                    and win.active_app.get_ui_snapshot()["confirm_target"] == "round",
+                ))
+                win._refresh_ui()
+                win.btn_confirm.click()
+
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app is None, timeout=8.0))
+                self.assertEqual(win._last_round_error, "")
+                self.assertEqual(len(list(tmp_path.glob("*_inference"))), 1)
+                self.assertEqual(len(list(tmp_path.glob("*_merged"))), 1)
+            finally:
+                win.close()
+                self.qapp.processEvents()
 
 
 if __name__ == "__main__":

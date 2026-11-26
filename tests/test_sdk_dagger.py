@@ -49,6 +49,7 @@ def _fast_mock_cfg(tmp_dir: Path) -> dict:
     cfg["recording"]["dagger_preroll_s"] = 0.08
     cfg["recording"]["save_confirm_timeout_s"] = 1.5
     cfg["recording"]["confirm_inference_save"] = False
+    cfg["recording"]["confirm_round_save"] = False
     cfg["inference"]["publish_rate"] = 50
     cfg["inference"]["inference_rate"] = 10
     return cfg

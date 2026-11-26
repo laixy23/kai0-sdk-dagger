@@ -123,6 +123,7 @@ class AsyncVideoExporter:
         self._queue: queue.Queue[VideoExportJob | None] = queue.Queue()
         self._pending_lock = threading.Lock()
         self._pending = 0
+        self._jobs: list[VideoExportJob] = []
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
@@ -134,8 +135,16 @@ class AsyncVideoExporter:
     def submit(self, job: VideoExportJob) -> VideoExportJob:
         with self._pending_lock:
             self._pending += 1
+            self._jobs.append(job)
         self._queue.put(job)
         return job
+
+    def cancel_all(self) -> None:
+        with self._pending_lock:
+            jobs = list(self._jobs)
+        for job in jobs:
+            job.cancel()
+        self._queue.join()
 
     def _worker(self) -> None:
         while True:
@@ -173,6 +182,10 @@ class AsyncVideoExporter:
                 job.done_event.set()
                 with self._pending_lock:
                     self._pending = max(0, self._pending - 1)
+                    try:
+                        self._jobs.remove(job)
+                    except ValueError:
+                        pass
                 self._queue.task_done()
 
     def wait_all(self, *, announce: bool = True) -> None:

@@ -150,6 +150,7 @@ recording:
   dagger_preroll_s: 1.0
   save_confirm_timeout_s: 10.0
   confirm_inference_save: true
+  confirm_round_save: true
 
 pedal:
   config_path: /home/ubuntu/dev/kai0-sdk-dagger/_runtime/foot-pedal.json

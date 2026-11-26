@@ -1558,6 +1558,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
 
     def _on_round_finished(self, rc: int, err: str) -> None:
         ds_name = self.active_app.dataset_name if self.active_app is not None else ""
+        round_discarded = bool(getattr(self.active_app, "round_discarded", False)) if self.active_app is not None else False
         self.active_app = None
         if self.pedal_worker is not None:
             self.pedal_worker.reset_gestures()
@@ -1565,6 +1566,9 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         if err:
             self._last_round_error = err
             self._append_standby_log(f"本轮异常结束（rc={rc}）：{err}", level="error")
+        elif round_discarded:
+            self._last_round_error = ""
+            self._append_standby_log(f"本轮数据已整轮丢弃并清理（{ds_name}），已进入待机。铺好衣物后踩「左双踩」或点「开始新一轮」。")
         else:
             self._last_round_error = ""
             self._append_standby_log(f"本轮已安全保存并进入待机（{ds_name}）。铺好衣物后踩「左双踩」或点「开始新一轮」。")
@@ -1619,7 +1623,11 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
 
         # Status badge & guidance banner
         confirm_target = snap.get("confirm_target")
-        confirm_kind_zh = "推理段" if confirm_target == "inference" else ("纠正段" if confirm_target == "dagger" else "本段")
+        confirm_kind_zh = (
+            "推理段" if confirm_target == "inference"
+            else ("纠正段" if confirm_target == "dagger"
+                  else ("整轮" if confirm_target == "round" else "本段"))
+        )
         if mode == "CONFIRM_SAVE":
             rem = snap["confirm_remaining_s"]
             badge_txt, fg, bg = f"● {confirm_kind_zh}删除确认 {rem:.1f}s", "#ffb4bc", "#4d1f26"
@@ -1732,9 +1740,16 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self.btn_save.setEnabled(ready and not stopping and mode == "DAGGER_RECORDING")
         in_confirm = (mode == "CONFIRM_SAVE")
         self.btn_delete.setEnabled(in_confirm)
-        self.btn_delete.setText(
-            f"撤销删除{confirm_kind_zh} ({snap['confirm_remaining_s']:.1f}s · w)" if in_confirm else "撤销删除刚存段 (w)"
-        )
+        if in_confirm:
+            if confirm_target == "round":
+                self.btn_delete.setText(f"丢弃整轮数据 ({snap['confirm_remaining_s']:.1f}s · w)")
+                self.btn_confirm.setText("确认保留整轮 (其他键/踏板)")
+            else:
+                self.btn_delete.setText(f"撤销删除{confirm_kind_zh} ({snap['confirm_remaining_s']:.1f}s · w)")
+                self.btn_confirm.setText("立即确认保留 (其他键/踏板)")
+        else:
+            self.btn_delete.setText("撤销删除刚存段 (w)")
+            self.btn_confirm.setText("立即确认保留 (其他键/踏板)")
         self.btn_confirm.setEnabled(in_confirm)
         self.btn_resume.setEnabled(ready and not stopping and not in_handoff and mode in ("DAGGER_RECORDING", "DAGGER_PAUSED"))
         self.btn_stop_round.setEnabled(not stopping or in_confirm)
@@ -1777,7 +1792,7 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
             qapp.removeEventFilter(self)
         self.history_tab.close_resources()
         if self.active_app is not None:
-            self.active_app.request_stop(signal.SIGINT)
+            self.active_app.request_stop(signal.SIGINT, skip_confirm=True)
         if self.round_worker is not None and self.round_worker.isRunning():
             self.round_worker.wait(15000)
         if self.pedal_worker is not None and self.pedal_worker.isRunning():

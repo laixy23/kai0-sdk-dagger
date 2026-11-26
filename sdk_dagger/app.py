@@ -8,6 +8,7 @@ import datetime
 import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import sys
 import termios
@@ -111,6 +112,7 @@ class SDKDaggerApp:
         self.dagger_preroll_s = float(rec.get("dagger_preroll_s", 1.0))
         self.save_confirm_timeout_s = float(rec.get("save_confirm_timeout_s", 10.0))
         self.confirm_inference_save = bool(rec.get("confirm_inference_save", True))
+        self.confirm_round_save = bool(rec.get("confirm_round_save", True))
 
         inf = cfg["inference"]
         self.publish_rate = float(inf.get("publish_rate", 30))
@@ -141,7 +143,9 @@ class SDKDaggerApp:
         self._pending_new_segment = False
         self._confirm_event = threading.Event()
         self._confirm_delete = False
-        self._confirm_target: str | None = None  # "inference" | "dagger" | None
+        self._confirm_target: str | None = None  # "inference" | "dagger" | "round" | None
+        self._round_discarded: bool = False
+        self._skip_shutdown_confirm: bool = False
 
         self._latest_sample: FrameSample | None = None
         self._latest_sample_lock = threading.Lock()
@@ -167,6 +171,11 @@ class SDKDaggerApp:
         self._obs_thread: threading.Thread | None = None
         self._infer_thread: threading.Thread | None = None
         self._input_thread: threading.Thread | None = None
+
+    @property
+    def round_discarded(self) -> bool:
+        with self._lock:
+            return self._round_discarded
 
     def set_collector_name(self, name: str | None) -> None:
         with self._lock:
@@ -228,6 +237,7 @@ class SDKDaggerApp:
             "last_infer_ms": last_infer_ms,
             "confirm_remaining_s": confirm_rem,
             "confirm_target": confirm_target,
+            "round_discarded": self._round_discarded,
             "current_inference_frames": cur_inf,
             "current_dagger_frames": cur_dag,
             "inference_episodes": inf_eps,
@@ -253,8 +263,10 @@ class SDKDaggerApp:
             "recent_events": recent_events,
         }
 
-    def request_stop(self, signum: int | None = None, _frame=None) -> None:
+    def request_stop(self, signum: int | None = None, _frame=None, *, skip_confirm: bool = False) -> None:
         self._signal_count += 1
+        if skip_confirm:
+            self._skip_shutdown_confirm = True
         if self._received_signal is None and signum is not None:
             self._received_signal = signum
         self._stop_event.set()
@@ -281,12 +293,13 @@ class SDKDaggerApp:
     def handle_operator_action(self, action: str, *, source: str = "keyboard") -> None:
         with self._lock:
             if self.mode == "CONFIRM_SAVE":
+                target_zh = "整轮数据" if self._confirm_target == "round" else "本段数据"
                 if action in ("w", "delete"):
                     self._confirm_delete = True
-                    print("\n已请求删除，正在删除本段数据……\n", flush=True)
+                    print(f"\n已请求删除，正在删除{target_zh}……\n", flush=True)
                 else:
                     self._confirm_delete = False
-                    print("\n已确认保留本段数据。\n", flush=True)
+                    print(f"\n已确认保留{target_zh}。\n", flush=True)
                 self._confirm_event.set()
                 return
 
@@ -850,6 +863,83 @@ class SDKDaggerApp:
         print("录制完成后请踩「右单踩」或按 s 保存本段数据", flush=True)
         print("=" * 70 + "\n", flush=True)
 
+    def _confirm_and_maybe_discard_round(self) -> bool:
+        """Ask operator whether to keep or discard the entire round before final merge/exit."""
+        if (
+            not self.confirm_round_save
+            or self._skip_shutdown_confirm
+            or self.save_confirm_timeout_s <= 0
+            or self._signal_count > 1
+        ):
+            return False
+
+        if self.inference_writer is not None and self.dagger_writer is not None:
+            inf_eps = self.inference_writer.episode_count
+            dag_eps = self.dagger_writer.episode_count
+        else:
+            inf_eps = next_episode_idx(self.inference_dir)
+            dag_eps = next_episode_idx(self.dagger_dir)
+        if inf_eps + dag_eps <= 0:
+            return False
+
+        print("\n" + "=" * 70, flush=True)
+        print(f"请确认是否保留本轮全部数据（模型推理 {inf_eps} 段 / 人工纠正 {dag_eps} 段）：", flush=True)
+        print(f"  - 如果整轮数据不要，请在 {self.save_confirm_timeout_s:.0f} 秒内按键盘 w 丢弃整轮；", flush=True)
+        print("  - 如果保留本轮，等待超时或踩任意踏板/按其他键立即确认保留。", flush=True)
+        print("=" * 70, flush=True)
+        print(f"等待整轮确认（{self.save_confirm_timeout_s:.0f} 秒后自动保留）……", flush=True)
+
+        with self._lock:
+            prev_mode = self.mode
+            self._confirm_delete = False
+            self._confirm_event.clear()
+            self._confirm_deadline = time.monotonic() + self.save_confirm_timeout_s
+            self._confirm_target = "round"
+            self.mode = "CONFIRM_SAVE"
+        self._emit_event(
+            f"整轮数据待确认（推理 {inf_eps} 段 / 纠正 {dag_eps} 段）：{self.save_confirm_timeout_s:.0f} 秒内按 w 或点「丢弃整轮数据」删除整轮，其他键/踏板保留",
+            level="warn",
+        )
+        self.voice.announce("saved_confirm")
+
+        self._confirm_event.wait(timeout=self.save_confirm_timeout_s)
+
+        with self._lock:
+            should_delete = self._confirm_delete
+            self._confirm_deadline = None
+            self._confirm_target = None
+            self.mode = prev_mode
+
+        if not should_delete:
+            self._emit_event(f"已确认保留本轮全部数据（推理 {inf_eps} 段 / 纠正 {dag_eps} 段），正在完成收尾落盘……")
+            self.voice.announce("confirmed")
+            return False
+
+        if self.video_exporter is not None:
+            self.video_exporter.cancel_all()
+
+        dirs_to_remove: list[Path] = []
+        if self.recording_format == "lerobot":
+            dirs_to_remove = [d for d in (self.inference_dir, self.dagger_dir, self.merged_dir) if d is not None]
+        else:
+            dirs_to_remove = [self.inference_dir.parent, self.dagger_dir.parent]
+        removed_names: list[str] = []
+        for d in dirs_to_remove:
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+                removed_names.append(d.name)
+
+        self._round_stitch_events.clear()
+        with self._lock:
+            self._round_discarded = True
+        print(
+            f"\n\033[33m[整轮丢弃] 已删除本轮全部数据目录：{', '.join(removed_names) or '(无目录)'}\033[0m",
+            flush=True,
+        )
+        self._emit_event(f"已丢弃本轮全部数据（已清理：{', '.join(removed_names) or '无'}）", level="warn")
+        self.voice.announce("deleted")
+        return True
+
     def run(self) -> int:
         in_main = threading.current_thread() is threading.main_thread()
         old_sigint = signal.signal(signal.SIGINT, self.request_stop) if in_main else None
@@ -949,16 +1039,26 @@ class SDKDaggerApp:
             self.rig.close()
             with self._samples_lock:
                 unsaved_inf = len(self._inference_samples)
-            if self._signal_count <= 1 and unsaved_inf >= 2:
-                print("[保存] 正在自动保存尚未保存的模型推理段……", flush=True)
-                self._save_inference_segment(capture_tail=False)
+                unsaved_dag = len(self._dagger_samples)
+            if self._signal_count <= 1:
+                if unsaved_inf >= 2:
+                    print("[保存] 正在自动保存尚未保存的模型推理段……", flush=True)
+                    self._save_inference_segment(
+                        capture_tail=False,
+                        wait_for_confirm=(False if self._skip_shutdown_confirm else None),
+                    )
+                if unsaved_dag >= 2:
+                    print("[保存] 正在自动保存尚未保存的人工纠正段……", flush=True)
+                    self._save_dagger_segment(wait_for_confirm=(not self._skip_shutdown_confirm))
+                self._confirm_and_maybe_discard_round()
             self._input_stop_event.set()
             if self._input_thread is not None and self._input_thread.is_alive():
                 self._input_thread.join(timeout=0.5)
             if self.video_exporter is not None:
-                self.video_exporter.close(wait=(self._signal_count <= 1))
+                self.video_exporter.close(wait=(self._signal_count <= 1 and not self._round_discarded))
             if (
                 self._signal_count <= 1
+                and not self._round_discarded
                 and self.recording_format == "lerobot"
                 and self.auto_merge_round
                 and self.merged_dir is not None

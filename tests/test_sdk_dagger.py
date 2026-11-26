@@ -48,6 +48,7 @@ def _fast_mock_cfg(tmp_dir: Path) -> dict:
     cfg["recording"]["inference_tail_s"] = 0.08
     cfg["recording"]["dagger_preroll_s"] = 0.08
     cfg["recording"]["save_confirm_timeout_s"] = 1.5
+    cfg["recording"]["confirm_inference_save"] = False
     cfg["inference"]["publish_rate"] = 50
     cfg["inference"]["inference_rate"] = 10
     return cfg
@@ -1168,6 +1169,81 @@ class HardwareContractTests(unittest.TestCase):
         cmd_norm, ramping_norm = rig._slew_limit_fa_joints_mdeg("left", [40200, -150, 100, 0, 250, -250], now=t + 0.005)
         self.assertFalse(ramping_norm)
         self.assertEqual(cmd_norm, [40200, -150, 100, 0, 250, -250])
+
+    def test_master_alignment_uses_high_follow_scurve_then_locks_with_0x00(self):
+        """Master alignment streams minimum-jerk S-curve in 0xAD once, then locks with 0x00 at target."""
+        import sys
+        import threading
+        import types
+        from unittest import mock
+        import numpy as np
+        from sdk_dagger import hardware as hw
+        from sdk_dagger.collision import HandleCollisionConfig
+
+        rig = object.__new__(hw.SDKDaggerRig)
+        rig.arm_cfg = {
+            "master_align_velocity": 30,
+            "master_align_tolerance_mdeg": 1000,
+            "master_align_control_mode": "high_follow",
+            "master_align_hz": 100,
+            "master_align_high_follow_velocity": 100,
+            "master_align_max_joint_vel_rad_s": 2.0,
+        }
+        rig.handle_collision_cfg = HandleCollisionConfig(enabled=True)
+
+        calls = {"left": [], "right": []}
+
+        def _make_master(side: str):
+            return types.SimpleNamespace(
+                _lock=threading.RLock(),
+                _piper=types.SimpleNamespace(
+                    MotionCtrl_2=lambda *a: calls[side].append(("MotionCtrl_2", a)),
+                    JointCtrl=lambda *j: calls[side].append(("JointCtrl", j)),
+                    GripperCtrl=lambda *g: calls[side].append(("GripperCtrl", g)),
+                ),
+            )
+
+        rig.master_left = _make_master("left")
+        rig.master_right = _make_master("right")
+
+        cur_l = np.array([0.0, 0.30, -0.30, 0.0, 0.0, 0.0, 0.01], dtype=np.float64)
+        cur_r = np.array([0.0, 0.30, -0.30, 0.0, 0.0, 0.0, 0.01], dtype=np.float64)
+        tgt_l = np.array([0.35, 0.65, -0.55, 0.15, -0.15, 0.20, 0.06], dtype=np.float64)
+        tgt_r = np.array([-0.35, 0.65, -0.55, -0.15, -0.15, -0.20, 0.06], dtype=np.float64)
+
+        def fake_read(arm):
+            q = cur_l if arm is rig.master_left else cur_r
+            return q.copy(), np.zeros(7), np.zeros(7), 0.0
+
+        def fake_wait(targets, *, since_timestamp, publish=None, **kwargs):
+            if publish is not None:
+                publish()
+            return {"passed": True}
+
+        fake_mod = types.SimpleNamespace(wait_for_master_alignment=fake_wait)
+        with mock.patch.object(hw, "_read_piper_arm_full_state", side_effect=fake_read), \
+             mock.patch.dict(sys.modules, {"master_alignment_feedback": fake_mod}), \
+             mock.patch.object(hw.time, "sleep", lambda _s: None):
+            ok = rig._move_masters_and_verify(tgt_l, tgt_r, label="测试对齐", duration_s=0.5, hold_seconds=0.0)
+
+        self.assertTrue(ok)
+        for side, cur, tgt in (("left", cur_l, tgt_l), ("right", cur_r, tgt_r)):
+            mc = [c[1] for c in calls[side] if c[0] == "MotionCtrl_2"]
+            jc = [np.asarray(c[1], dtype=np.float64) for c in calls[side] if c[0] == "JointCtrl"]
+            # Must enter 0xAD exactly once at start, then switch to 0x00 at target (and during wait_for_master_alignment)
+            self.assertEqual(mc[0], (0x01, 0x01, 100, 0xAD))
+            self.assertEqual(mc.count((0x01, 0x01, 100, 0xAD)), 1)
+            self.assertGreaterEqual(len(mc), 2)
+            self.assertTrue(all(m == (0x01, 0x01, 30, 0x00) for m in mc[1:]))
+            # Anchor frame equals measured pose (zero-jump entry) and final frame equals target
+            np.testing.assert_allclose(jc[0], np.round(cur[:6] * hw.RAD_TO_MDEG), atol=1)
+            np.testing.assert_allclose(jc[-1], np.round(tgt[:6] * hw.RAD_TO_MDEG), atol=1)
+            # S-curve smoothness: first and last trajectory deltas are tiny compared to peak mid-trajectory delta
+            # Exclude final duplicate publish_targets() call(s) after 0xAD->0x00 switch
+            traj_jc = jc[:-3]
+            diffs = np.max(np.abs(np.diff(np.asarray(traj_jc), axis=0)), axis=1)
+            self.assertLess(diffs[0], 0.05 * np.max(diffs))
+            self.assertLess(diffs[-1], 0.05 * np.max(diffs))
 
 
 if __name__ == "__main__":

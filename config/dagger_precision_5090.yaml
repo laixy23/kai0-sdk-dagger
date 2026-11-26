@@ -79,7 +79,7 @@ arm:
       duration_scale: 1.0
       min_duration_s: 0.0
       max_duration_s: 0.0
-  init_steps: 100
+  init_steps: 300
   init_sleep_s: 0.01
   init_action:
     left: [0.0, 0.32, -0.36, 0.0, 0.24, 0.0, 0.07]
@@ -91,6 +91,11 @@ arm:
   master_hold_seconds: 3.0
   master_align_tolerance_mdeg: 1000
   master_align_velocity: 30
+  # 主臂对齐轨迹控制模式：high_follow (0xAD 100Hz 定频 + 五次 S-curve 平滑插补，到位后切回 0x00 锁位校验) | position (0x00)
+  master_align_control_mode: high_follow
+  master_align_hz: 100
+  master_align_high_follow_velocity: 100
+  master_align_max_joint_vel_rad_s: 1.2
   # 人工遥操（FA 直转）从臂控制模式：high_follow (0xAD，与推理一致，带限速平滑保护) | position (0x00)
   fa_control_mode: high_follow
   fa_forward_velocity: 100
@@ -144,6 +149,7 @@ recording:
   inference_tail_s: 1.0
   dagger_preroll_s: 1.0
   save_confirm_timeout_s: 10.0
+  confirm_inference_save: true
 
 pedal:
   config_path: /home/ubuntu/dev/kai0-sdk-dagger/_runtime/foot-pedal.json

@@ -525,8 +525,15 @@ def project_pose_to_handle_safe(
     }
 
 
+def _minimum_jerk(u: np.ndarray | float) -> np.ndarray | float:
+    """Fifth-order minimum-jerk S-curve s(u) = 10u^3 - 15u^4 + 6u^5 (zero vel & accel at endpoints)."""
+    u2 = u * u
+    u3 = u2 * u
+    return u3 * (10.0 + u * (-15.0 + 6.0 * u))
+
+
 def _resample_polyline(waypoints: list[np.ndarray], total_steps: int) -> np.ndarray:
-    """Resample a joint-space polyline into total_steps smooth cosine-eased samples (N, 6)."""
+    """Resample a joint-space polyline into total_steps minimum-jerk S-curve samples (N, 6)."""
     pts = [np.asarray(p, dtype=np.float64).reshape(6) for p in waypoints]
     if len(pts) <= 1 or total_steps <= 1:
         return np.asarray([pts[-1]], dtype=np.float64)
@@ -544,9 +551,9 @@ def _resample_polyline(waypoints: list[np.ndarray], total_steps: int) -> np.ndar
             n_seg = max(3, int(round(total_steps * (slen / total_len))))
             n_seg = min(n_seg, max(1, remaining - (len(seg_lens) - 1 - i)))
         remaining -= n_seg
-        # Smooth cosine ease-in-out on each leg so velocity starts/ends cleanly at via points
+        # Fifth-order minimum-jerk S-curve on each leg: zero velocity AND zero acceleration at endpoints
         ts = np.linspace(0.0, 1.0, n_seg + 1, dtype=np.float64)[1:]
-        alphas = 0.5 - 0.5 * np.cos(np.pi * ts)
+        alphas = _minimum_jerk(ts)
         p0, p1 = pts[i], pts[i + 1]
         for a in alphas:
             out.append((1.0 - a) * p0 + a * p1)

@@ -28,7 +28,8 @@ def require(condition, message):
 
 def decode_feedback(frames, now, since_timestamp=0.0):
     """Decode independent raw frames; SDK aggregate timestamps are insufficient."""
-    require(all(key in frames for key in REQUIRED_IDS), "Missing required CAN feedback frames")
+    missing = [f"0x{key:03X}" for key in REQUIRED_IDS if key not in frames]
+    require(not missing, f"Missing required CAN feedback frames ({', '.join(missing)})")
     ages = {}
     for key in REQUIRED_IDS:
         data, stamp = frames[key]
@@ -59,7 +60,7 @@ def decode_feedback(frames, now, since_timestamp=0.0):
 def sample_feedback(channel, since_timestamp=0.0):
     import can  # No SDK import or instance is needed for passive inspection.
     frames = {}
-    deadline = time.monotonic() + 0.12
+    deadline = time.monotonic() + 0.18
     with can.Bus(channel=channel, interface="socketcan", receive_own_messages=False) as bus:
         while time.monotonic() < deadline:
             message = bus.recv(timeout=max(0, deadline - time.monotonic()))
@@ -75,7 +76,10 @@ def sample_feedback(channel, since_timestamp=0.0):
                         "Arm fault observed during sampling")
             elif 0x261 <= message.arbitration_id <= 0x266:
                 require(not data[5] & 0xBF, "Driver fault observed during sampling")
-            frames[message.arbitration_id] = (data, message.timestamp)
+            if message.timestamp >= since_timestamp:
+                frames[message.arbitration_id] = (data, message.timestamp)
+                if len(frames) == len(REQUIRED_IDS):
+                    break
     return decode_feedback(frames, time.time(), since_timestamp)
 
 

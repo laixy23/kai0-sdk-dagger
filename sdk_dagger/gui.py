@@ -1450,10 +1450,14 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
 
         snap = self.active_app.get_ui_snapshot()
         if token == "stop":
+            if snap["mode"] == "CONFIRM_SAVE" and snap["stopping"]:
+                self._append_standby_log("[踏板] 确认保留当前段并完成本轮结束……")
+                self.active_app.handle_operator_action("resume", source="pedal")
+                return
             self._append_standby_log("[踏板] 收到「右双踩」，正在结束本轮并进入待机……")
             self.stop_current_round()
             return
-        if snap["ready"] and token in ("left", "save", "resume", "delete"):
+        if (snap["ready"] or snap["mode"] == "CONFIRM_SAVE") and token in ("left", "save", "resume", "delete"):
             self.active_app.handle_operator_action(token, source="pedal")
 
     def _refresh_daily_stats(self) -> dict[str, Any]:
@@ -1521,7 +1525,8 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self._last_round_error = ""
         self.round_count += 1
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dataset_name = f"cloth_sdk_{ts}_{os.getpid()}_r{self.round_count}"
+        prefix = str((self.cfg.get("recording") or {}).get("dataset_prefix", "cloth_sdk"))
+        dataset_name = f"{prefix}_{ts}_{os.getpid()}_r{self.round_count}"
         collector = self.collector_combo.currentData()
         app = SDKDaggerApp(
             self.cfg,
@@ -1542,6 +1547,11 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
 
     def stop_current_round(self) -> None:
         if self.active_app is None:
+            return
+        snap = self.active_app.get_ui_snapshot()
+        if snap["mode"] == "CONFIRM_SAVE" and snap["stopping"]:
+            self.active_app.handle_operator_action("resume", source="gui")
+            self._refresh_ui()
             return
         self.active_app.request_stop(signal.SIGINT)
         self._refresh_ui()
@@ -1605,10 +1615,15 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         in_handoff = snap["in_exit_handoff"]
 
         if self.pedal_worker is not None:
-            self.pedal_worker.set_allow_short(ready and not stopping)
+            self.pedal_worker.set_allow_short(ready and (not stopping or mode == "CONFIRM_SAVE"))
 
         # Status badge & guidance banner
-        if stopping:
+        confirm_target = snap.get("confirm_target")
+        confirm_kind_zh = "推理段" if confirm_target == "inference" else ("纠正段" if confirm_target == "dagger" else "本段")
+        if mode == "CONFIRM_SAVE":
+            rem = snap["confirm_remaining_s"]
+            badge_txt, fg, bg = f"● {confirm_kind_zh}删除确认 {rem:.1f}s", "#ffb4bc", "#4d1f26"
+        elif stopping:
             badge_txt, fg, bg = "● 正在安全停止并落盘…", "#f7d6a8", "#3d2f1e"
         elif not ready:
             badge_txt, fg, bg = "● 正在初始化与归位…", "#9ec7f2", "#1c2f45"
@@ -1620,9 +1635,6 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
             badge_txt, fg, bg = "● 主臂自动对齐中…", "#ffe08a", "#42341a"
         elif mode == "DAGGER_RECORDING":
             badge_txt, fg, bg = "● 人工纠正录制中", "#7ad8ff", "#15364a"
-        elif mode == "CONFIRM_SAVE":
-            rem = snap["confirm_remaining_s"]
-            badge_txt, fg, bg = f"● 删除确认 {rem:.1f}s", "#ffb4bc", "#4d1f26"
         elif mode == "DAGGER_PAUSED":
             badge_txt, fg, bg = "● 示教已暂停（跟随暂停）", "#d2dceb", "#273548"
         else:
@@ -1697,7 +1709,9 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
                 )
 
         # Metrics
-        self.metrics["inference"].setText(f"{snap['inference_episodes']} 段 / {snap['inference_saved_frames']} 帧")
+        inf_del_cnt = snap.get("inference_deleted_attempts", 0)
+        inf_del_suffix = f" · 删{inf_del_cnt}" if inf_del_cnt else ""
+        self.metrics["inference"].setText(f"{snap['inference_episodes']} 段 / {snap['inference_saved_frames']} 帧{inf_del_suffix}")
         del_cnt = snap["dagger_deleted_attempts"]
         del_suffix = f" · 删{del_cnt}" if del_cnt else ""
         self.metrics["dagger"].setText(f"{snap['dagger_episodes']} 段 / {snap['dagger_saved_frames']} 帧{del_suffix}")
@@ -1716,14 +1730,14 @@ class SDKDaggerMainWindow(QtWidgets.QMainWindow):
         self.btn_takeover.setEnabled(ready and not stopping and mode in ("INFERENCE", "DAGGER_PAUSED"))
         self.btn_takeover.setText("开始下段纠正 (d / 左单)" if mode == "DAGGER_PAUSED" else "人工接管 (d / 左单)")
         self.btn_save.setEnabled(ready and not stopping and mode == "DAGGER_RECORDING")
-        in_confirm = (mode == "CONFIRM_SAVE" and not stopping)
+        in_confirm = (mode == "CONFIRM_SAVE")
         self.btn_delete.setEnabled(in_confirm)
         self.btn_delete.setText(
-            f"撤销删除本段 ({snap['confirm_remaining_s']:.1f}s · w)" if in_confirm else "撤销删除刚存段 (w)"
+            f"撤销删除{confirm_kind_zh} ({snap['confirm_remaining_s']:.1f}s · w)" if in_confirm else "撤销删除刚存段 (w)"
         )
         self.btn_confirm.setEnabled(in_confirm)
         self.btn_resume.setEnabled(ready and not stopping and not in_handoff and mode in ("DAGGER_RECORDING", "DAGGER_PAUSED"))
-        self.btn_stop_round.setEnabled(not stopping)
+        self.btn_stop_round.setEnabled(not stopping or in_confirm)
         self.tabs.setTabEnabled(1, False)
 
         # Cameras + Arm readouts

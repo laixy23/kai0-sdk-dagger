@@ -27,6 +27,7 @@ def _fast_gui_cfg(tmp_dir: Path) -> dict:
     cfg["recording"]["inference_tail_s"] = 0.08
     cfg["recording"]["dagger_preroll_s"] = 0.08
     cfg["recording"]["save_confirm_timeout_s"] = 2.0
+    cfg["recording"]["confirm_inference_save"] = False
     cfg["inference"]["publish_rate"] = 50
     cfg["inference"]["inference_rate"] = 10
     return cfg
@@ -120,7 +121,7 @@ class SDKDaggerGUITests(unittest.TestCase):
                 self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.mode == "CONFIRM_SAVE"))
                 win._refresh_ui()
                 self.assertTrue(win.btn_delete.isEnabled())
-                self.assertIn("撤销删除本段", win.btn_delete.text())
+                self.assertIn("撤销删除", win.btn_delete.text())
                 win.btn_delete.click()
                 self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.mode == "DAGGER_PAUSED"))
                 win._refresh_ui()
@@ -351,6 +352,124 @@ class SDKDaggerGUITests(unittest.TestCase):
         self.assertGreaterEqual(flaky.attempts, 2)
         self.assertTrue(any((not ok and "自动重试中" in txt) for ok, txt in statuses))
         self.assertTrue(any((ok and "双踏板已连接" in txt) for ok, txt in statuses))
+
+    def test_gui_inference_segment_confirm_delete_on_takeover_and_stop(self):
+        """Inference segments enter CONFIRM_SAVE countdown (both before takeover and on round stop) and can be discarded."""
+        from sdk_dagger.voice import VoiceAnnouncer
+
+        announced: list[str] = []
+        voice = VoiceAnnouncer(enabled=True, runner=lambda _k, _p, _t: None)
+        _orig_announce = voice.announce
+
+        def _spy_announce(clip_key: str, *, fallback_text: str | None = None) -> None:
+            announced.append(clip_key)
+            _orig_announce(clip_key, fallback_text=fallback_text)
+
+        voice.announce = _spy_announce  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = _fast_gui_cfg(tmp_path)
+            cfg["recording"]["confirm_inference_save"] = True
+            cfg["recording"]["save_confirm_timeout_s"] = 3.0
+            win = SDKDaggerMainWindow(
+                cfg, dataset_dir=tmp_path, mock=True, enable_pedal=False, auto_start=False, voice=voice,
+            )
+            try:
+                win.btn_start_round.click()
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app is not None and win.active_app.get_ui_snapshot()["ready"]))
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.get_ui_snapshot()["current_inference_frames"] >= 5))
+                win._refresh_ui()
+                self.assertTrue(win.btn_takeover.isEnabled())
+
+                # 1. Takeover triggers inference save -> CONFIRM_SAVE (target="inference") -> discard it!
+                win.btn_takeover.click()
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None and win.active_app.mode == "CONFIRM_SAVE",
+                ))
+                win._refresh_ui()
+                snap = win.active_app.get_ui_snapshot()
+                self.assertEqual(snap["confirm_target"], "inference")
+                self.assertTrue(win.btn_delete.isEnabled())
+                self.assertIn("撤销删除推理段", win.btn_delete.text())
+                win.btn_delete.click()
+
+                # After deleting inference segment, flow proceeds smoothly into DAGGER_RECORDING
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None and win.active_app.mode == "DAGGER_RECORDING",
+                ))
+                time.sleep(0.16)
+                win._refresh_ui()
+                self.assertTrue(win.btn_save.isEnabled())
+
+                # Save a DAgger segment and confirm keeping it
+                win.btn_save.click()
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None and win.active_app.mode == "CONFIRM_SAVE",
+                ))
+                win._refresh_ui()
+                self.assertEqual(win.active_app.get_ui_snapshot()["confirm_target"], "dagger")
+                win.btn_confirm.click()
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None and win.active_app.mode == "DAGGER_PAUSED",
+                ))
+                win._refresh_ui()
+                self.assertTrue(win.btn_resume.isEnabled())
+
+                # Resume inference -> collect a second inference segment -> stop round -> CONFIRM_SAVE even while stopping -> discard!
+                win.btn_resume.click()
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None and win.active_app.mode == "INFERENCE",
+                ))
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app.get_ui_snapshot()["current_inference_frames"] >= 5))
+                win._refresh_ui()
+                win.btn_stop_round.click()
+                self.assertTrue(_pump_until(
+                    self.qapp,
+                    lambda: win.active_app is not None and win.active_app.mode == "CONFIRM_SAVE",
+                ))
+                win._refresh_ui()
+                self.assertTrue(win.btn_delete.isEnabled())
+                self.assertIn("撤销删除推理段", win.btn_delete.text())
+                win.btn_delete.click()
+
+                # Round finishes cleanly back to standby
+                self.assertTrue(_pump_until(self.qapp, lambda: win.active_app is None, timeout=8.0))
+                self.assertEqual(win._last_round_error, "")
+
+                # Verify both inference segments were deleted & recorded in timeline, while DAgger segment was kept
+                inf_dirs = sorted(tmp_path.glob("*_inference"))
+                dag_dirs = sorted(tmp_path.glob("*_dagger"))
+                merged_dirs = sorted(tmp_path.glob("*_merged"))
+                self.assertEqual(len(inf_dirs), 1)
+                self.assertEqual(len(dag_dirs), 1)
+                self.assertEqual(len(merged_dirs), 1)
+                self.assertEqual(list((inf_dirs[0] / "data/chunk-000").glob("*.parquet")), [])
+                inf_timeline = [
+                    json.loads(line)
+                    for line in (inf_dirs[0] / "meta/session_timeline.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                deleted_inf_events = [ev for ev in inf_timeline if ev.get("event") == "deleted"]
+                self.assertEqual(len(deleted_inf_events), 2)
+                self.assertEqual(len(list((dag_dirs[0] / "data/chunk-000").glob("*.parquet"))), 1)
+                # Merged dataset only contains the 1 kept DAgger segment (no discarded inference segments)
+                merged_eps = [
+                    json.loads(line)
+                    for line in (merged_dirs[0] / "meta/episodes.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len(merged_eps), 1)
+                self.assertEqual([s["source"] for s in merged_eps[0]["source_segments"]], ["dagger"])
+                self.assertEqual(announced.count("deleted"), 2)
+                self.assertGreaterEqual(announced.count("saved_confirm"), 3)
+            finally:
+                win.close()
+                self.qapp.processEvents()
 
 
     def test_daily_merged_rounds_counter_and_history_summary(self):

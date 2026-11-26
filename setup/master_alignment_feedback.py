@@ -116,8 +116,11 @@ def wait_for_master_alignment(targets, *, since_timestamp, publish=None,
                 or initial_stable_since is not None and (
                     not math.isfinite(initial_stable_since) or initial_stable_since > start)):
             raise ValueError("Invalid alignment timing or tolerance")
-        # Each production reader is bounded to .12 s. Reserve the pair's read
-        # window instead of starting another pair at the timeout boundary.
+        # Each production reader is bounded to <= 0.18 s (exits early around ~50 ms once complete).
+        # Tolerate brief transient missing-frame hiccups (e.g. right after 0xAD->0x00 mode switch),
+        # while still aborting immediately on real arm/driver/SocketCAN faults.
+        transient_misses = 0
+        max_transient_misses = 3
         while clock() + 0.25 < deadline:
             if guard is not None:
                 guard()
@@ -126,13 +129,24 @@ def wait_for_master_alignment(targets, *, since_timestamp, publish=None,
             if publish is not None:
                 publish()
             all_close = True
+            transient_err = None
             for side, channel in CHANNELS.items():
                 if guard is not None:
                     guard()
-                row = reader(channel, since_timestamp=since_timestamp)
-                joints, grip, stamps = checked_feedback(
-                    row, now=wall(), since_timestamp=since_timestamp,
-                    previous=previous.get(side))
+                try:
+                    row = reader(channel, since_timestamp=since_timestamp)
+                    joints, grip, stamps = checked_feedback(
+                        row, now=wall(), since_timestamp=since_timestamp,
+                        previous=previous.get(side))
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if (msg.startswith("Missing required CAN feedback frames")
+                            or msg.startswith("Stale/pre-command feedback:")):
+                        transient_misses += 1
+                        if transient_misses <= max_transient_misses:
+                            transient_err = msg
+                            break
+                    raise
                 previous[side] = stamps
                 delta = [actual - target for actual, target in zip(joints, converted[side]["joint_mdeg"])]
                 close = all(abs(value) <= tolerance_mdeg for value in delta)
@@ -146,6 +160,12 @@ def wait_for_master_alignment(targets, *, since_timestamp, publish=None,
                 }
                 if guard is not None:
                     guard()
+            if transient_err is not None:
+                stable_since = None
+                report["stable_elapsed_s"] = 0.0
+                pause(min(0.03, max(0.0, deadline - clock())))
+                continue
+            transient_misses = 0
             report["samples"] += 1
             observed = clock()
             if shutdown():

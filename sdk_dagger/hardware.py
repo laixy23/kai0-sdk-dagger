@@ -471,21 +471,27 @@ class SDKDaggerRig:
 
         speed = int(self.arm_cfg.get("master_align_velocity", 30))
         tol_mdeg = int(self.arm_cfg.get("master_align_tolerance_mdeg", 1000))
+        align_mode = str(self.arm_cfg.get("master_align_control_mode", "high_follow")).strip().lower()
+        use_high_follow = align_mode in ("high_follow", "high-follow", "0xad", "ad")
         targets = {"left": list(left_target7), "right": list(right_target7)}
 
-        def publish_pose(vec_l7: np.ndarray, vec_r7: np.ndarray, *, vel: int = speed) -> None:
+        def publish_pose(vec_l7: np.ndarray, vec_r7: np.ndarray, *,
+                         vel: int = speed, mode: int | None = 0x00,
+                         send_gripper: bool = True) -> None:
             for arm, vec in ((self.master_left, vec_l7), (self.master_right, vec_r7)):
                 joints = [round(float(v) * RAD_TO_MDEG) for v in vec[:6]]
                 grip = round(min(0.08, max(0.0, float(vec[6]))) * 1_000_000)
                 with arm._lock:
-                    arm._piper.MotionCtrl_2(0x01, 0x01, int(vel), 0x00)
+                    if mode is not None:
+                        arm._piper.MotionCtrl_2(0x01, 0x01, int(vel), int(mode))
                     arm._piper.JointCtrl(*joints)
-                    arm._piper.GripperCtrl(grip, 1000, 0x01, 0)
+                    if send_gripper:
+                        arm._piper.GripperCtrl(grip, 1000, 0x01, 0)
 
         def publish_targets() -> None:
-            publish_pose(left_target7, right_target7, vel=speed)
+            publish_pose(left_target7, right_target7, vel=speed, mode=0x00, send_gripper=True)
 
-        # Read actual current master poses and plan synchronized collision-avoiding trajectories
+        # Read actual current master poses and plan synchronized collision-avoiding S-curve trajectories
         # so the 100mm teach handle never sweeps into the base/table during Step 1/2 OR Step 2/2.
         cur_l7 = None
         cur_r7 = None
@@ -497,15 +503,35 @@ class SDKDaggerRig:
         except Exception:
             cur_l7 = cur_r7 = None
 
-        if cur_l7 is not None and cur_r7 is not None and self.handle_collision_cfg.enabled:
-            dt = 0.04  # 25 Hz synchronized waypoint stream
-            base_steps = max(15, int(round(float(duration_s) / dt)))
+        if cur_l7 is not None and cur_r7 is not None and (use_high_follow or self.handle_collision_cfg.enabled):
+            hz = float(np.clip(float(self.arm_cfg.get("master_align_hz", 100.0 if use_high_follow else 25.0)), 20.0, 200.0))
+            dt = 1.0 / hz
+            base_steps = max(15, int(round(max(0.2, float(duration_s)) * hz)))
             traj_l, info_l = plan_safe_master_trajectory(
                 cur_l7[:6], left_target7[:6], self.handle_collision_cfg, num_steps=base_steps
             )
             traj_r, info_r = plan_safe_master_trajectory(
                 cur_r7[:6], right_target7[:6], self.handle_collision_cfg, num_steps=base_steps
             )
+            # Enforce max joint velocity cap so long/detour moves stay gentle and never jerk
+            max_vel_rad_s = float(self.arm_cfg.get("master_align_max_joint_vel_rad_s", 1.2))
+            if max_vel_rad_s > 0.05:
+                peak_vel = 0.0
+                for q0, tr in ((cur_l7[:6], traj_l), (cur_r7[:6], traj_r)):
+                    if len(tr) > 0:
+                        seq = np.vstack([q0[None, :], tr])
+                        step_max = float(np.max(np.abs(np.diff(seq, axis=0))))
+                        peak_vel = max(peak_vel, step_max / dt)
+                if peak_vel > max_vel_rad_s:
+                    scale = peak_vel / max_vel_rad_s
+                    scaled_steps = max(base_steps + 1, int(math.ceil(base_steps * scale)))
+                    traj_l, info_l = plan_safe_master_trajectory(
+                        cur_l7[:6], left_target7[:6], self.handle_collision_cfg, num_steps=scaled_steps
+                    )
+                    traj_r, info_r = plan_safe_master_trajectory(
+                        cur_r7[:6], right_target7[:6], self.handle_collision_cfg, num_steps=scaled_steps
+                    )
+
             for side_zh, info in (("左", info_l), ("右", info_r)):
                 if info.get("detour"):
                     init_mm = float(info.get("initial_clearance_m", 0.0)) * 1000.0
@@ -514,21 +540,61 @@ class SDKDaggerRig:
                         f"（安全余量 {init_mm:.1f} mm），已自动规划绕行轨迹同步避让……",
                         flush=True,
                     )
+
             n_total = max(len(traj_l), len(traj_r))
-            track_vel = max(speed, 45)
-            for k in range(n_total):
-                if shutdown_fn():
-                    return False
-                il = min(k, len(traj_l) - 1)
-                ir = min(k, len(traj_r) - 1)
-                frac = float(k + 1) / float(n_total)
-                gl = (1.0 - frac) * float(cur_l7[6]) + frac * float(left_target7[6])
-                gr = (1.0 - frac) * float(cur_r7[6]) + frac * float(right_target7[6])
-                wl = np.concatenate([traj_l[il], [gl]])
-                wr = np.concatenate([traj_r[ir], [gr]])
-                publish_pose(wl, wr, vel=track_vel)
-                time.sleep(dt)
-            publish_targets()
+            if use_high_follow:
+                hf_vel = int(self.arm_cfg.get("master_align_high_follow_velocity", 100))
+                grip_every = max(1, int(round(hz / 25.0)))
+                # Enter 0xAD once anchored at current measured pose (zero-jump entry)
+                publish_pose(cur_l7, cur_r7, vel=hf_vel, mode=0xAD, send_gripper=True)
+                t_start = time.monotonic()
+                for k in range(n_total):
+                    if shutdown_fn():
+                        # Exit 0xAD cleanly at last commanded pose on abort
+                        last_l = traj_l[min(max(k - 1, 0), len(traj_l) - 1)] if k > 0 else cur_l7[:6]
+                        last_r = traj_r[min(max(k - 1, 0), len(traj_r) - 1)] if k > 0 else cur_r7[:6]
+                        publish_pose(
+                            np.concatenate([last_l, [cur_l7[6]]]),
+                            np.concatenate([last_r, [cur_r7[6]]]),
+                            vel=speed, mode=0x00, send_gripper=False,
+                        )
+                        return False
+                    il = min(k, len(traj_l) - 1)
+                    ir = min(k, len(traj_r) - 1)
+                    u = float(k + 1) / float(n_total)
+                    s_grip = (u ** 3) * (10.0 + u * (-15.0 + 6.0 * u))
+                    gl = (1.0 - s_grip) * float(cur_l7[6]) + s_grip * float(left_target7[6])
+                    gr = (1.0 - s_grip) * float(cur_r7[6]) + s_grip * float(right_target7[6])
+                    wl = np.concatenate([traj_l[il], [gl]])
+                    wr = np.concatenate([traj_r[ir], [gr]])
+                    is_last = (k == n_total - 1)
+                    publish_pose(wl, wr, vel=hf_vel, mode=None, send_gripper=(is_last or (k % grip_every == 0)))
+                    sleep_s = (t_start + (k + 1) * dt) - time.monotonic()
+                    if sleep_s > 0.0:
+                        time.sleep(sleep_s)
+                # Trajectory complete: switch back to 0x00 position mode and let CAN/firmware settle before verification
+                publish_targets()
+                time.sleep(0.06)
+                publish_targets()
+            else:
+                track_vel = max(speed, 45)
+                t_start = time.monotonic()
+                for k in range(n_total):
+                    if shutdown_fn():
+                        return False
+                    il = min(k, len(traj_l) - 1)
+                    ir = min(k, len(traj_r) - 1)
+                    u = float(k + 1) / float(n_total)
+                    s_grip = (u ** 3) * (10.0 + u * (-15.0 + 6.0 * u))
+                    gl = (1.0 - s_grip) * float(cur_l7[6]) + s_grip * float(left_target7[6])
+                    gr = (1.0 - s_grip) * float(cur_r7[6]) + s_grip * float(right_target7[6])
+                    wl = np.concatenate([traj_l[il], [gl]])
+                    wr = np.concatenate([traj_r[ir], [gr]])
+                    publish_pose(wl, wr, vel=track_vel, mode=0x00, send_gripper=True)
+                    sleep_s = (t_start + (k + 1) * dt) - time.monotonic()
+                    if sleep_s > 0.0:
+                        time.sleep(sleep_s)
+                publish_targets()
         else:
             end_t = time.monotonic() + float(duration_s)
             while time.monotonic() < end_t and not shutdown_fn():

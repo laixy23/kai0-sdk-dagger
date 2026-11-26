@@ -110,6 +110,7 @@ class SDKDaggerApp:
         self.inference_tail_s = float(rec.get("inference_tail_s", 1.0))
         self.dagger_preroll_s = float(rec.get("dagger_preroll_s", 1.0))
         self.save_confirm_timeout_s = float(rec.get("save_confirm_timeout_s", 10.0))
+        self.confirm_inference_save = bool(rec.get("confirm_inference_save", True))
 
         inf = cfg["inference"]
         self.publish_rate = float(inf.get("publish_rate", 30))
@@ -128,6 +129,7 @@ class SDKDaggerApp:
         self._lock = threading.RLock()
         self._samples_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._input_stop_event = threading.Event()
         self._signal_count = 0
         self._received_signal: int | None = None
 
@@ -139,6 +141,7 @@ class SDKDaggerApp:
         self._pending_new_segment = False
         self._confirm_event = threading.Event()
         self._confirm_delete = False
+        self._confirm_target: str | None = None  # "inference" | "dagger" | None
 
         self._latest_sample: FrameSample | None = None
         self._latest_sample_lock = threading.Lock()
@@ -195,6 +198,7 @@ class SDKDaggerApp:
             started_at = self._started_at
             last_infer_ms = self._last_infer_ms
             confirm_deadline = self._confirm_deadline
+            confirm_target = self._confirm_target
             collector_name = self.collector_name
             inf_step = self._inference_step
             recent_events = list(self._event_log)[-50:]
@@ -202,6 +206,7 @@ class SDKDaggerApp:
         confirm_rem = max(0.0, confirm_deadline - now) if (mode == "CONFIRM_SAVE" and confirm_deadline is not None) else 0.0
         inf_eps = self.inference_writer.episode_count if self.inference_writer is not None else next_episode_idx(self.inference_dir)
         inf_frames = self.inference_writer.total_frames if self.inference_writer is not None else 0
+        inf_deleted = self.inference_writer.deleted_attempts_count if self.inference_writer is not None else 0
         dag_eps = self.dagger_writer.episode_count if self.dagger_writer is not None else self._dagger_episode_idx
         dag_frames = self.dagger_writer.total_frames if self.dagger_writer is not None else 0
         dag_deleted = self.dagger_writer.deleted_attempts_count if self.dagger_writer is not None else 0
@@ -222,10 +227,12 @@ class SDKDaggerApp:
             "inference_step": inf_step,
             "last_infer_ms": last_infer_ms,
             "confirm_remaining_s": confirm_rem,
+            "confirm_target": confirm_target,
             "current_inference_frames": cur_inf,
             "current_dagger_frames": cur_dag,
             "inference_episodes": inf_eps,
             "inference_saved_frames": inf_frames,
+            "inference_deleted_attempts": inf_deleted,
             "dagger_episodes": dag_eps,
             "dagger_saved_frames": dag_frames,
             "dagger_deleted_attempts": dag_deleted,
@@ -253,6 +260,7 @@ class SDKDaggerApp:
         self._stop_event.set()
         self._confirm_event.set()
         if self._signal_count > 1:
+            self._input_stop_event.set()
             print("\n[强制退出] 收到第二次中断信号，立即退出（未写完的文件可能不完整）。", flush=True)
             raise KeyboardInterrupt
 
@@ -346,7 +354,7 @@ class SDKDaggerApp:
         pedal_buf = b""
         token_map = {b"left": "left", b"save": "save", b"resume": "resume", b"delete": "delete"}
         try:
-            while not self._stop_event.is_set():
+            while not self._input_stop_event.is_set():
                 watch = [fd for fd in (stdin_fd, cmd_fd) if fd is not None]
                 if not watch:
                     time.sleep(0.05)
@@ -483,15 +491,17 @@ class SDKDaggerApp:
                 continue
             last_t = _sleep_rate(last_t, self.inference_rate)
 
-    def _save_inference_segment(self, *, capture_tail: bool) -> dict[str, Any]:
+    def _save_inference_segment(self, *, capture_tail: bool, wait_for_confirm: bool | None = None) -> dict[str, Any]:
         if capture_tail and self.inference_tail_s > 0 and not self._stop_event.is_set():
             with self._lock:
                 self.mode = "INFERENCE_TAIL"
             self._stop_event.wait(self.inference_tail_s)
 
         with self._lock:
+            prev_mode = self.mode
             if self.mode == "INFERENCE_TAIL":
                 self.mode = "TRANSITION_TO_DAGGER"
+                prev_mode = "TRANSITION_TO_DAGGER"
 
         with self._samples_lock:
             samples = list(self._inference_samples)
@@ -516,16 +526,76 @@ class SDKDaggerApp:
                 video_codec=self.video_codec, video_preset=self.video_preset, video_crf=self.video_crf,
                 video_exporter=self.video_exporter,
             )
-        if res["saved"]:
-            self._last_saved_inference_episode = res.get("episode_idx")
+        if not res["saved"]:
+            return res
+
+        print(f"\033[32m>>> 模型推理段已保存：{res['data_path']}（共 {res['frames']} 帧）\033[0m", flush=True)
+
+        do_confirm = self.confirm_inference_save if wait_for_confirm is None else bool(wait_for_confirm)
+        should_delete = False
+        if do_confirm and self.save_confirm_timeout_s > 0 and self._signal_count <= 1:
+            print("\n" + "=" * 70, flush=True)
+            print("请确认刚刚保存的模型推理段是否正确：", flush=True)
+            print(f"  - 如果推理跑坏了，请在 {self.save_confirm_timeout_s:.0f} 秒内按键盘 w 丢弃本段；", flush=True)
+            print("  - 如果正确，等待超时或踩任意踏板/按其他键立即确认保留。", flush=True)
+            print("=" * 70, flush=True)
+            print(f"等待确认（{self.save_confirm_timeout_s:.0f} 秒后自动保留）……", flush=True)
+
+            with self._lock:
+                self._confirm_delete = False
+                self._confirm_event.clear()
+                self._confirm_deadline = time.monotonic() + self.save_confirm_timeout_s
+                self._confirm_target = "inference"
+                self.mode = "CONFIRM_SAVE"
+            self._emit_event(
+                f"模型推理段 episode_{res['episode_idx']:06d} 已保存（{res['frames']} 帧）：{self.save_confirm_timeout_s:.0f} 秒内按 w 或点「撤销删除」可丢弃",
+                level="warn",
+            )
+            self.voice.announce("saved_confirm")
+
+            self._confirm_event.wait(timeout=self.save_confirm_timeout_s)
+
+            with self._lock:
+                should_delete = self._confirm_delete
+                self._confirm_deadline = None
+                self._confirm_target = None
+                self.mode = prev_mode
+
+        if should_delete:
             self._round_stitch_events.append({
-                "kind": "segment",
-                "source": "inference",
-                "episode_index": int(res["episode_idx"]),
-                "frames": int(res["frames"]),
+                "kind": "break",
+                "reason": "inference_deleted",
+                "timestamp": datetime.datetime.now().isoformat(timespec="milliseconds"),
+                "attempt_index": res.get("attempt_idx"),
             })
-            print(f"\033[32m>>> 模型推理段已保存：{res['data_path']}（共 {res['frames']} 帧）\033[0m", flush=True)
-            self._emit_event(f"模型推理段 episode_{res['episode_idx']:06d} 已保存（{res['frames']} 帧）")
+            if self.inference_writer is not None:
+                self.inference_writer.delete_last_episode(res, reason="operator_w_delete_inference")
+                print(
+                    f"\n\033[32m本段模型推理已丢弃（编号保持连续；缺失记录 attempt={res.get('attempt_idx')} 已写入 meta/session_timeline.jsonl）。\033[0m",
+                    flush=True,
+                )
+                self._emit_event(
+                    f"已丢弃模型推理段 attempt={res.get('attempt_idx')}（编号保持连续，缺口已记入 session_timeline.jsonl）",
+                    level="warn",
+                )
+                self.voice.announce("deleted")
+            else:
+                delete_episode(res["hdf5_path"], res["video_paths"], video_job=res.get("video_job"))
+                print("\n\033[32m本段模型推理已丢弃。\033[0m", flush=True)
+            res["deleted"] = True
+            return res
+
+        res["deleted"] = False
+        self._last_saved_inference_episode = res.get("episode_idx")
+        self._round_stitch_events.append({
+            "kind": "segment",
+            "source": "inference",
+            "episode_index": int(res["episode_idx"]),
+            "frames": int(res["frames"]),
+        })
+        self._emit_event(f"模型推理段 episode_{res['episode_idx']:06d} 已确认保留（{res['frames']} 帧）")
+        if do_confirm and self.save_confirm_timeout_s > 0:
+            self.voice.announce("confirmed")
         return res
 
     def _save_dagger_segment(self, *, wait_for_confirm: bool = True) -> dict[str, Any]:
@@ -587,6 +657,7 @@ class SDKDaggerApp:
                 self._confirm_delete = False
                 self._confirm_event.clear()
                 self._confirm_deadline = time.monotonic() + self.save_confirm_timeout_s
+                self._confirm_target = "dagger"
                 self.mode = "CONFIRM_SAVE"
             self._emit_event(
                 f"纠正段 episode_{ep_idx:06d} 已保存（{res['frames']} 帧）：{self.save_confirm_timeout_s:.0f} 秒内按 w 或点「撤销删除」可删除",
@@ -599,6 +670,7 @@ class SDKDaggerApp:
             with self._lock:
                 should_delete = self._confirm_delete
                 self._confirm_deadline = None
+                self._confirm_target = None
 
         if should_delete:
             self._round_stitch_events.append({
@@ -880,6 +952,9 @@ class SDKDaggerApp:
             if self._signal_count <= 1 and unsaved_inf >= 2:
                 print("[保存] 正在自动保存尚未保存的模型推理段……", flush=True)
                 self._save_inference_segment(capture_tail=False)
+            self._input_stop_event.set()
+            if self._input_thread is not None and self._input_thread.is_alive():
+                self._input_thread.join(timeout=0.5)
             if self.video_exporter is not None:
                 self.video_exporter.close(wait=(self._signal_count <= 1))
             if (
@@ -933,7 +1008,8 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    dataset_name = args.dataset_name or os.environ.get("DATASET_NAME") or f"cloth_sdk_{ts}_{os.getpid()}"
+    prefix = str((cfg.get("recording") or {}).get("dataset_prefix", "cloth_sdk"))
+    dataset_name = args.dataset_name or os.environ.get("DATASET_NAME") or f"{prefix}_{ts}_{os.getpid()}"
     dataset_dir = args.dataset_dir or os.environ.get("DATASET_DIR") or None
     app = SDKDaggerApp(cfg, dataset_name=dataset_name, dataset_dir=dataset_dir, mock=args.mock)
     return app.run()
